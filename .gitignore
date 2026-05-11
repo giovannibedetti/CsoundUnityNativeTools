@@ -1,0 +1,24 @@
+# CMake build directories
+native-input/build-*/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/cmake_install.cmake
+**/Makefile
+**/*.dir/
+**/Debug/
+**/Release/
+
+# Android build artefacts
+android-midi/*.aar
+android-midi/*.jar
+android-midi/build/
+
+# macOS
+.DS_Store
+
+# Editor / IDE noise
+.idea/
+.vscode/
+*.user
+*.suo
+*.vs/
