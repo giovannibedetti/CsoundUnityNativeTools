@@ -81,6 +81,7 @@ struct Session
     int                  deviceChannelCount = 0;       // actual WASAPI device-format channels
     int                  sampleFmt          = SF_FLOAT32; // raw device sample format
     int                  bytesPerSample     = 4;        // raw device sample size in bytes
+    bool                 exclusive          = false;    // true when opened in exclusive mode
     int                  latencyFrames      = 0;
     std::atomic<bool>    running            { false };
     float                sampleRate         = 0.f;
@@ -210,57 +211,81 @@ static DWORD WINAPI CaptureThreadProc(LPVOID param)
 
     HANDLE events[2] = { s->stopEvent, s->readyEvent };
 
+    // Process one captured buffer into the ring buffer (real data or silent fill).
+    auto processBuf = [&](BYTE* pData, UINT32 numFrames, DWORD flags)
+    {
+        if (pData && numFrames > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT))
+        {
+            // Convert the raw device format to float and extract the requested
+            // channels (handles float32 shared mode and integer exclusive mode).
+            cniConvertExtractWrite(s, pData, numFrames);
+            gFramesCaptured += numFrames;
+        }
+        else if (numFrames > 0 && s->channelCount > 0)
+        {
+            // Silent flag — push frame-aligned zeros to keep the ring buffer in
+            // sync. Clamp to whole frames that fit so no cni_rb_write is truncated
+            // to an odd sample count (which would swap L/R).
+            const uint32_t reqCh = (uint32_t)s->channelCount;
+            uint32_t freeFrames = cni_rb_free_space(s->ringBuffer) / reqCh;
+            uint32_t frames     = (numFrames < freeFrames) ? numFrames : freeFrames;
+            uint32_t total      = frames * reqCh;
+            float    zeroBuf[512] = { 0 };
+            uint32_t written = 0;
+            while (written < total)
+            {
+                uint32_t chunk = (total - written < 512) ? (total - written) : 512;
+                cni_rb_write(s->ringBuffer, zeroBuf, chunk);
+                written += chunk;
+            }
+        }
+    };
+
     while (s->running)
     {
         // Wake on either event with a 10 ms safety timeout. In event-driven mode
         // (EVENTCALLBACK) readyEvent fires once per engine period. In timer-driven
         // mode (resample path, no EVENTCALLBACK) readyEvent never fires and the
-        // timeout drives draining. Either way we drain all available packets below,
-        // so a timeout is not skipped — only the stopEvent breaks the loop.
+        // timeout drives draining. Either way we drain below, so a timeout is not
+        // skipped — only the stopEvent breaks the loop.
         DWORD waitResult = WaitForMultipleObjects(2, events, FALSE, 10);
         if (waitResult == WAIT_OBJECT_0) break; // stopEvent (index 0)
 
-        UINT32 packetFrames = 0;
-        if (FAILED(s->captureClient->GetNextPacketSize(&packetFrames))) break;
-
-        while (packetFrames > 0)
+        if (s->exclusive)
         {
+            // Exclusive event-driven: consume EXACTLY ONE buffer per readyEvent
+            // signal. Looping with GetBuffer here re-reads the same period buffer
+            // on this driver (GetBuffer doesn't report empty after ReleaseBuffer
+            // within one event) → 2x frames + comb-filter noise.
+            if (waitResult != (WAIT_OBJECT_0 + 1)) continue; // only on readyEvent
             BYTE*  pData     = nullptr;
             UINT32 numFrames = 0;
             DWORD  flags     = 0;
-
             HRESULT hr = s->captureClient->GetBuffer(
                 &pData, &numFrames, &flags, nullptr, nullptr);
-            if (FAILED(hr)) break;
-
-            if (pData && numFrames > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT))
+            if (SUCCEEDED(hr) && numFrames > 0)
             {
-                // Convert the raw device format to float and extract the requested
-                // channels (handles float32 shared mode and integer exclusive mode).
-                cniConvertExtractWrite(s, pData, numFrames);
-                gFramesCaptured += numFrames;
+                processBuf(pData, numFrames, flags);
+                s->captureClient->ReleaseBuffer(numFrames);
             }
-            else if (numFrames > 0 && s->channelCount > 0)
+        }
+        else
+        {
+            // Shared mode: packet-based drain.
+            UINT32 packetFrames = 0;
+            if (FAILED(s->captureClient->GetNextPacketSize(&packetFrames))) break;
+            while (packetFrames > 0)
             {
-                // Silent flag — push frame-aligned zeros to keep the ring buffer in
-                // sync. Clamp to whole frames that fit so no cni_rb_write is
-                // truncated to an odd sample count (which would swap L/R).
-                const uint32_t reqCh = (uint32_t)s->channelCount;
-                uint32_t freeFrames = cni_rb_free_space(s->ringBuffer) / reqCh;
-                uint32_t frames     = (numFrames < freeFrames) ? numFrames : freeFrames;
-                uint32_t total      = frames * reqCh;
-                float    zeroBuf[512] = { 0 };
-                uint32_t written = 0;
-                while (written < total)
-                {
-                    uint32_t chunk = (total - written < 512) ? (total - written) : 512;
-                    cni_rb_write(s->ringBuffer, zeroBuf, chunk);
-                    written += chunk;
-                }
+                BYTE*  pData     = nullptr;
+                UINT32 numFrames = 0;
+                DWORD  flags     = 0;
+                HRESULT hr = s->captureClient->GetBuffer(
+                    &pData, &numFrames, &flags, nullptr, nullptr);
+                if (FAILED(hr)) break;
+                processBuf(pData, numFrames, flags);
+                s->captureClient->ReleaseBuffer(numFrames);
+                s->captureClient->GetNextPacketSize(&packetFrames);
             }
-
-            s->captureClient->ReleaseBuffer(numFrames);
-            s->captureClient->GetNextPacketSize(&packetFrames);
         }
     }
 
@@ -379,12 +404,17 @@ CNI_API void cni_close();
 //   bufferSizeFrames– latency hint for the classic fallback path
 //   sampleRate      – must match Unity's output rate
 //   ksmps           – Csound ksmps; target for the IAudioClient3 period
+//   exclusiveMode   – 1 = try WASAPI exclusive mode first (lowest latency, but
+//                     locks the device); 0 = shared mode (coexists with other
+//                     apps), with exclusive only as a last-resort fallback
 // ---------------------------------------------------------------------------
 CNI_API int cni_open(int deviceIndex, int channelCount,
-                     int bufferSizeFrames, float sampleRate, int ksmps)
+                     int bufferSizeFrames, float sampleRate, int ksmps,
+                     int exclusiveMode)
 {
     if (gSession.running) cni_close();
     gFramesCaptured = 0;
+    gSession.exclusive = false;
 
     if (ksmps <= 0) ksmps = 128;
 
@@ -506,14 +536,103 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
         gSession.channelCount       = channelCount;
         gSession.sampleRate         = (float)useFormat->nSamplesPerSec;
 
+        // Re-activate a fresh IAudioClient. A failed Initialize/IsFormatSupported
+        // can leave the previous one in an undefined state, so each attempt below
+        // starts from a clean client.
+        auto reactivate = [&]() -> bool {
+            SafeRelease((IUnknown**)&gSession.audioClient);
+            return SUCCEEDED(gSession.device->Activate(
+                __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                (void**)&gSession.audioClient));
+        };
+
+        // Exclusive-mode attempt. Bypasses the shared engine for the lowest
+        // latency, but locks the device. Exclusive cannot resample, so it is only
+        // valid when the device already runs at Unity's rate. Probes float32 then
+        // common integer PCM formats; on success sets useFormat / gSession fields.
+        auto tryExclusive = [&]() -> HRESULT {
+            if (!ratesMatch) return E_FAIL;
+            const DWORD exSr   = pwfx->nSamplesPerSec;
+            const WORD  exCh   = pwfx->nChannels;
+            const DWORD exMask = devMask ? devMask :
+                                 (exCh == 1) ? SPEAKER_FRONT_CENTER :
+                                 (exCh == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
+            struct Cand { WORD bits; WORD valid; bool pcm; };
+            const Cand cands[] = {
+                { 32, 32, false }, // float32
+                { 32, 24, true  }, // 24-in-32 int
+                { 24, 24, true  }, // 24-bit packed int
+                { 16, 16, true  }, // 16-bit int
+            };
+            HRESULT eh = E_FAIL;
+            for (int ci = 0; ci < 4; ci++)
+            {
+                ZeroMemory(&exWfx, sizeof(exWfx));
+                exWfx.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+                exWfx.Format.nChannels       = exCh;
+                exWfx.Format.nSamplesPerSec  = exSr;
+                exWfx.Format.wBitsPerSample  = cands[ci].bits;
+                exWfx.Format.nBlockAlign     = (WORD)(exCh * cands[ci].bits / 8);
+                exWfx.Format.nAvgBytesPerSec = exSr * exWfx.Format.nBlockAlign;
+                exWfx.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+                exWfx.Samples.wValidBitsPerSample = cands[ci].valid;
+                exWfx.dwChannelMask          = exMask;
+                exWfx.SubFormat = cands[ci].pcm ? KSDATAFORMAT_SUBTYPE_PCM
+                                                : KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+                if (!reactivate()) return E_FAIL;
+                HRESULT hrFmt = gSession.audioClient->IsFormatSupported(
+                        AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX*)&exWfx, nullptr);
+                if (hrFmt != S_OK) continue;
+
+                REFERENCE_TIME defPer = 0, minPer = 0;
+                gSession.audioClient->GetDevicePeriod(&defPer, &minPer);
+                REFERENCE_TIME per = defPer;
+                eh = gSession.audioClient->Initialize(
+                    AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    per, per, (WAVEFORMATEX*)&exWfx, nullptr);
+
+                // Driver wants a specific aligned buffer size — recompute & retry.
+                if (eh == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)
+                {
+                    UINT32 alignedFrames = 0;
+                    gSession.audioClient->GetBufferSize(&alignedFrames);
+                    REFERENCE_TIME ap = (REFERENCE_TIME)(1e7 * alignedFrames / exSr + 0.5);
+                    if (reactivate())
+                        eh = gSession.audioClient->Initialize(
+                            AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                            ap, ap, (WAVEFORMATEX*)&exWfx, nullptr);
+                }
+
+                if (SUCCEEDED(eh))
+                {
+                    useFormat = (WAVEFORMATEX*)&exWfx;
+                    gSession.deviceChannelCount = exCh;
+                    gSession.sampleRate         = (float)exSr;
+                    gSession.exclusive          = true;
+                    eventDriven = true;
+                    return eh;
+                }
+            }
+            return eh;
+        };
+
+        bool done = false;
+
+        // (A) Preferred exclusive mode (lowest latency) when requested by the host.
+        if (exclusiveMode && ratesMatch)
+        {
+            hr = tryExclusive();
+            if (SUCCEEDED(hr)) done = true;
+        }
 
         // ----------------------------------------------------------------
-        // IAudioClient3 path (Windows 10+): target period = ksmps.
+        // (B) IAudioClient3 path (Windows 10+): target period = ksmps.
         // The WASAPI event fires exactly once per ksmps frames, perfectly
         // matching the Csound processing cadence. Only attempted when the
         // device runs at Unity's rate (IAudioClient3 cannot resample).
         // ----------------------------------------------------------------
-        if (tryClient3)
+        if (!done && tryClient3)
         {
             IAudioClient3* pAC3 = nullptr;
             HRESULT hrQI = gSession.audioClient->QueryInterface(
@@ -559,9 +678,11 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
                 }
                 pAC3->Release();
             }
+            if (usedClient3) { hr = S_OK; done = true; }
         }
 
-        if (!usedClient3)
+        // (C) Classic shared mode, then last-resort exclusive.
+        if (!done)
         {
             // When resampling (device rate != Unity rate) the shared-mode engine
             // needs AUTOCONVERTPCM | SRC_DEFAULT_QUALITY to insert a sample-rate
@@ -577,16 +698,7 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
             REFERENCE_TIME hnsMin = 400000; // 40 ms
             if (hnsBuffer < hnsMin) hnsBuffer = hnsMin;
 
-            // Re-activate a fresh client: a failed Initialize can leave the
-            // previous one in an undefined state.
-            auto reactivate = [&]() -> bool {
-                SafeRelease((IUnknown**)&gSession.audioClient);
-                return SUCCEEDED(gSession.device->Activate(
-                    __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                    (void**)&gSession.audioClient));
-            };
-
-            // One Initialize attempt with logging.
+            // One shared-mode Initialize attempt on a fresh client.
             auto tryInit = [&](DWORD flags, REFERENCE_TIME buf,
                                WAVEFORMATEX* fmt, const char* label) -> HRESULT {
                 if (!reactivate()) return E_FAIL;
@@ -636,90 +748,19 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
                 }
             }
 
-            // 5. Exclusive-mode fallback. Pro / ASIO-centric drivers (e.g. Zoom)
-            //    often reject shared mode entirely but work in exclusive mode,
-            //    which also gives the lowest latency. Exclusive does not resample,
-            //    so only attempt it when the device runs at Unity's rate.
-            //    Probe float32 first, then common integer PCM formats.
-            if (FAILED(hr) && ratesMatch)
+            // 5. Last-resort exclusive mode, unless it was already attempted above
+            //    as the preferred mode. Pro / ASIO-centric drivers often reject
+            //    shared mode but work in exclusive.
+            if (FAILED(hr) && !exclusiveMode)
             {
-                const DWORD exSr   = pwfx->nSamplesPerSec;
-                const WORD  exCh   = pwfx->nChannels;
-                const DWORD exMask = devMask ? devMask :
-                                     (exCh == 1) ? SPEAKER_FRONT_CENTER :
-                                     (exCh == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
-
-                struct Cand { WORD bits; WORD valid; bool pcm; };
-                const Cand cands[] = {
-                    { 32, 32, false }, // float32
-                    { 32, 24, true  }, // 24-in-32 int
-                    { 24, 24, true  }, // 24-bit packed int
-                    { 16, 16, true  }, // 16-bit int
-                };
-
-                bool exOk = false;
-                for (int ci = 0; ci < 4 && !exOk; ci++)
-                {
-                    ZeroMemory(&exWfx, sizeof(exWfx));
-                    exWfx.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
-                    exWfx.Format.nChannels       = exCh;
-                    exWfx.Format.nSamplesPerSec  = exSr;
-                    exWfx.Format.wBitsPerSample  = cands[ci].bits;
-                    exWfx.Format.nBlockAlign     = (WORD)(exCh * cands[ci].bits / 8);
-                    exWfx.Format.nAvgBytesPerSec = exSr * exWfx.Format.nBlockAlign;
-                    exWfx.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-                    exWfx.Samples.wValidBitsPerSample = cands[ci].valid;
-                    exWfx.dwChannelMask          = exMask;
-                    exWfx.SubFormat = cands[ci].pcm ? KSDATAFORMAT_SUBTYPE_PCM
-                                                    : KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-
-                    if (!reactivate()) break;
-                    HRESULT hrFmt = gSession.audioClient->IsFormatSupported(
-                        AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX*)&exWfx, nullptr);
-                    if (hrFmt != S_OK) continue;
-
-                    REFERENCE_TIME defPer = 0, minPer = 0;
-                    gSession.audioClient->GetDevicePeriod(&defPer, &minPer);
-
-                    REFERENCE_TIME per = defPer;
-                    hr = gSession.audioClient->Initialize(
-                        AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                        per, per, (WAVEFORMATEX*)&exWfx, nullptr);
-
-                    // Driver wants a specific aligned buffer size — recompute & retry.
-                    if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)
-                    {
-                        UINT32 alignedFrames = 0;
-                        gSession.audioClient->GetBufferSize(&alignedFrames);
-                        REFERENCE_TIME ap =
-                            (REFERENCE_TIME)(1e7 * alignedFrames / exSr + 0.5);
-                        if (reactivate())
-                        {
-                            hr = gSession.audioClient->Initialize(
-                                AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                ap, ap, (WAVEFORMATEX*)&exWfx, nullptr);
-                        }
-                    }
-
-                    if (SUCCEEDED(hr))
-                    {
-                        useFormat = (WAVEFORMATEX*)&exWfx;
-                        gSession.deviceChannelCount = exCh;
-                        gSession.sampleRate         = (float)exSr;
-                        eventDriven = true;
-                        exOk = true;
-                    }
-                }
+                HRESULT eh = tryExclusive();
+                if (SUCCEEDED(eh)) hr = eh;
             }
 
             if (FAILED(hr))
             {
                 errCode = -7; // Initialize failed
             }
-        }
-        else
-        {
-            hr = S_OK;
         }
 
         // Classify the final chosen format so the capture thread knows how to
@@ -825,6 +866,7 @@ CNI_API void cni_close()
     gSession.deviceChannelCount = 0;
     gSession.latencyFrames      = 0;
     gSession.sampleRate         = 0.f;
+    gSession.exclusive          = false;
 }
 
 // ---------------------------------------------------------------------------
