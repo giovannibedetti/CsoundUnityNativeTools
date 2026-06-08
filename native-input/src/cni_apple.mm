@@ -241,8 +241,9 @@ static int SetupAudioUnit(Session* s, int channelCount, int bufferSizeFrames, fl
     AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_SetInputCallback,
                          kAudioUnitScope_Global, 1, &cb, sizeof(cb));
 
-    // Maximum frames per slice (hint for buffer allocation).
-    UInt32 maxFrames = (UInt32)bufferSizeFrames * 2;
+    // 4× headroom covers SRC-expanded frame counts (e.g. 44100→48000 ≈ 1.09×)
+    // and devices that snap bufferSizeFrames up to the next power-of-two.
+    UInt32 maxFrames = (UInt32)bufferSizeFrames * 4;
     AudioUnitSetProperty(s->audioUnit, kAudioUnitProperty_MaximumFramesPerSlice,
                          kAudioUnitScope_Global, 0, &maxFrames, sizeof(maxFrames));
 
@@ -379,7 +380,13 @@ static int PlatformOpen(Session* s, int deviceIndex, int channelCount, int buffe
     }
 
     s->channelCount = channelCount;
-    s->sampleRate   = MacGetSampleRate(devId);
+    // Use the rate Unity requests (AudioSettings.outputSampleRate) so that the
+    // AUHAL output-scope format matches what the Unity audio thread expects.
+    // When the hardware nominal rate differs (e.g. mic at 44100, Unity at 48000)
+    // CoreAudio applies transparent SRC — far better than the ring buffer
+    // draining at 6900 samples/s and producing periodic underrun glitches.
+    float hwRate    = MacGetSampleRate(devId);
+    s->sampleRate   = (sampleRate > 0.f) ? sampleRate : hwRate;
 
     // devId is passed into SetupAudioUnit so it can bind the device BEFORE
     // AudioUnitInitialize (macOS AUHAL requirement).
@@ -545,7 +552,8 @@ CNI_API int cni_open(int deviceIndex, int channelCount, int bufferSizeFrames, fl
     if (err != 0) return err;
 
     // Allocate capture buffers (non-interleaved, one per channel).
-    uint32_t framesHint = (uint32_t)(bufferSizeFrames * 2);
+    // 4× to absorb SRC-expanded frame counts without realloc in the first callback.
+    uint32_t framesHint = (uint32_t)(bufferSizeFrames * 4);
     if (!AllocCaptureBuffers(&gSession, gSession.channelCount, framesHint))
     {
         AudioComponentInstanceDispose(gSession.audioUnit);

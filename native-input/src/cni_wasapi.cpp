@@ -69,6 +69,7 @@ struct Session
 };
 
 static Session gSession;
+static std::atomic<uint64_t> gFramesCaptured { 0 };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -129,6 +130,7 @@ static DWORD WINAPI CaptureThreadProc(LPVOID param)
                 // but the mix format can vary. We requested WAVE_FORMAT_IEEE_FLOAT at Open().
                 uint32_t total = numFrames * (uint32_t)s->channelCount;
                 cni_rb_write(s->ringBuffer, (const float*)pData, total);
+                gFramesCaptured.fetch_add(numFrames, std::memory_order_relaxed);
             }
             else if (numFrames > 0)
             {
@@ -404,6 +406,7 @@ CNI_API void cni_close()
     gSession.channelCount  = 0;
     gSession.latencyFrames = 0;
     gSession.sampleRate    = 0.f;
+    gFramesCaptured.store(0, std::memory_order_relaxed);
 }
 
 CNI_API int cni_read_frames(float* outBuffer, int frameCount, int channelCount)
@@ -421,4 +424,9 @@ CNI_API int cni_get_input_latency_frames()
 CNI_API int cni_is_running()
 {
     return gSession.running ? 1 : 0;
+}
+
+CNI_API uint64_t cni_get_frames_captured()
+{
+    return gFramesCaptured.load(std::memory_order_relaxed);
 }
