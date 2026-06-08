@@ -92,6 +92,19 @@ inline uint32_t cni_rb_write(CniRingBuffer* rb, const float* src, uint32_t count
     return count;
 }
 
+// Consumer: advances the read pointer by up to `count` samples (discards unread data).
+// Use this to trim a stale backlog before reading, keeping ring-buffer latency bounded.
+// Returns the actual number of samples skipped.
+inline uint32_t cni_rb_skip(CniRingBuffer* rb, uint32_t count)
+{
+    uint32_t avail = cni_rb_available(rb);
+    if (count > avail) count = avail;
+    if (count == 0) return 0;
+    uint32_t r = rb->readHead.load(std::memory_order_relaxed);
+    rb->readHead.store(r + count, std::memory_order_release);
+    return count;
+}
+
 // Consumer: reads up to `count` samples into `dst`.
 // Unread slots are zero-filled on underrun.
 // Returns the number of samples actually read from the buffer

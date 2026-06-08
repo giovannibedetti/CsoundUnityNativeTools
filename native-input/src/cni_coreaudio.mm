@@ -197,8 +197,13 @@ CNI_API float cni_get_device_nominal_sample_rate(int index)
 }
 
 // Returns 0 on success, negative error code on failure.
-CNI_API int cni_open(int deviceIndex, int channelCount, int bufferSizeFrames, float sampleRate)
+// ksmps / exclusiveMode are accepted to keep the C ABI identical to the Windows
+// (WASAPI) backend so the shared P/Invoke signature matches on every platform.
+// They are unused in this legacy CoreAudio backend.
+CNI_API int cni_open(int deviceIndex, int channelCount, int bufferSizeFrames, float sampleRate,
+                     int ksmps, int exclusiveMode)
 {
+    (void)ksmps; (void)exclusiveMode;
     if (gSession.running) cni_close();
 
     std::lock_guard<std::mutex> lock(gMutex);
