@@ -133,19 +133,23 @@ static OSStatus InputCallback(void*                       inRefCon,
         if (renderErr != lastErr)
         {
             lastErr = renderErr;
-            fprintf(stderr, "[CsoundNativeInput] AudioUnitRender error: %d\n", (int)renderErr);
+            NSLog(@"[CsoundNativeInput] AudioUnitRender error: %d", (int)renderErr);
         }
         return noErr;
     }
-    gFramesCaptured.fetch_add(inNumberFrames, std::memory_order_relaxed);
-
     // Interleave non-interleaved channel buffers → ring buffer.
     int ch = s->channelCount;
     for (UInt32 f = 0; f < inNumberFrames; f++)
         for (int c = 0; c < ch; c++)
             s->interleaveBuf[f * ch + c] = ((float*)s->captureABL->mBuffers[c].mData)[f];
 
-    cni_rb_write(s->ringBuffer, s->interleaveBuf, inNumberFrames * (uint32_t)ch);
+    // Clamp to whole frames before writing. cni_rb_write truncates to free space,
+    // which may not be a multiple of channelCount — a partial-frame write shifts
+    // the interleave and permanently swaps L/R for all subsequent reads.
+    uint32_t freeFrames = cni_rb_free_space(s->ringBuffer) / (uint32_t)ch;
+    uint32_t frames     = (inNumberFrames < freeFrames) ? (uint32_t)inNumberFrames : freeFrames;
+    cni_rb_write(s->ringBuffer, s->interleaveBuf, frames * (uint32_t)ch);
+    gFramesCaptured.fetch_add(frames, std::memory_order_relaxed);
     return noErr;
 }
 

@@ -8,6 +8,7 @@
 #include "cni_ringbuffer.h"
 #include <aaudio/AAudio.h>
 #include <android/log.h>
+#include <algorithm>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -47,14 +48,23 @@ static std::mutex              gMutex;
 
 struct Session
 {
-    AAudioStream*       stream        = nullptr;
-    CniRingBuffer*      ringBuffer    = nullptr;
-    int                 channelCount  = 0;
-    std::atomic<bool>   running       { false };
-    int                 latencyFrames = 0;
+    AAudioStream*           stream        = nullptr;
+    CniRingBuffer*          ringBuffer    = nullptr;
+    int                     channelCount  = 0;
+    std::atomic<bool>       running       { false };
+    int                     latencyFrames = 0;
+    std::atomic<uint32_t>   underrunCount { 0 };
+    std::atomic<uint32_t>   overrunCount  { 0 };
+    // Pre-fill: hold off reading until the ring buffer has accumulated this many
+    // samples. Absorbs the jitter between Unity's audio-block drain and AAudio's
+    // gradual refill, preventing the systematic underruns that happen when Unity
+    // reads faster than AAudio can fill at startup.
+    std::atomic<bool>       prefilled     { false };
+    uint32_t                prefillTarget { 0 };
 };
 
 static Session gSession;
+static std::atomic<uint64_t> gFramesCaptured { 0 };
 
 // ---------------------------------------------------------------------------
 // AAudio data callback (called on a high-priority audio thread by AAudio)
@@ -69,9 +79,21 @@ static aaudio_data_callback_result_t DataCallback(
     Session* s = (Session*)userData;
     if (!s->running || !s->ringBuffer) return AAUDIO_CALLBACK_RESULT_CONTINUE;
 
-    // AAudio delivers interleaved float32 samples directly.
-    uint32_t total = (uint32_t)(numFrames * s->channelCount);
-    cni_rb_write(s->ringBuffer, (const float*)audioData, total);
+    // Clamp to whole frames before writing. cni_rb_write truncates to free space,
+    // which may not be a multiple of channelCount — a partial-frame write shifts
+    // the interleave and permanently swaps L/R for all subsequent reads.
+    uint32_t freeFrames = cni_rb_free_space(s->ringBuffer) / (uint32_t)s->channelCount;
+    uint32_t frames     = (uint32_t)numFrames;
+    if (frames > freeFrames)
+    {
+        s->overrunCount.fetch_add(1, std::memory_order_relaxed);
+        frames = freeFrames;
+    }
+    if (frames > 0)
+    {
+        cni_rb_write(s->ringBuffer, (const float*)audioData, frames * (uint32_t)s->channelCount);
+        gFramesCaptured.fetch_add(frames, std::memory_order_relaxed);
+    }
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -208,7 +230,13 @@ CNI_API int cni_open(int deviceIndex, int channelCount, int bufferSizeFrames, fl
     gSession.channelCount  = actualChannels;
     gSession.latencyFrames = actualFramesPerBurst * 2; // approximate
 
-    uint32_t ringCap = (uint32_t)(actualFramesPerBurst * actualChannels * kRingBufferMultiplier);
+    // Size the ring buffer so it can hold at least one full Unity DSP block.
+    // bufferSizeFrames is max(_requestedBufferFrames, AudioSettings.bufferSize) from C#,
+    // so it reflects the actual OnAudioFilterRead block size (e.g. 1024 frames).
+    // Without this, a 96-frame burst × 8 = 768-frame ring is smaller than Unity's
+    // 1024-frame block, guaranteeing underruns on every audio callback.
+    uint32_t ringBase = (uint32_t)std::max({actualFramesPerBurst, ksmps, bufferSizeFrames});
+    uint32_t ringCap  = ringBase * (uint32_t)actualChannels * kRingBufferMultiplier;
     gSession.ringBuffer = cni_rb_create(ringCap);
     if (!gSession.ringBuffer)
     {
@@ -229,6 +257,11 @@ CNI_API int cni_open(int deviceIndex, int channelCount, int bufferSizeFrames, fl
     }
 
     gSession.running = true;
+    gSession.underrunCount.store(0,     std::memory_order_relaxed);
+    gSession.overrunCount.store(0,      std::memory_order_relaxed);
+    gSession.prefilled.store(false,     std::memory_order_relaxed);
+    // Wait for 2× Unity DSP block before consuming — absorbs scheduling jitter.
+    gSession.prefillTarget = (uint32_t)bufferSizeFrames * (uint32_t)actualChannels * 2;
     LOGD("AAudio input opened: %d ch @ %d Hz, burst %d frames, sharing=%s",
          actualChannels,
          (int)AAudioStream_getSampleRate(gSession.stream),
@@ -253,13 +286,57 @@ CNI_API void cni_close()
     gSession.ringBuffer    = nullptr;
     gSession.channelCount  = 0;
     gSession.latencyFrames = 0;
+    gSession.underrunCount.store(0,  std::memory_order_relaxed);
+    gSession.overrunCount.store(0,   std::memory_order_relaxed);
+    gSession.prefilled.store(false,  std::memory_order_relaxed);
+    gSession.prefillTarget = 0;
+    gFramesCaptured.store(0, std::memory_order_relaxed);
 }
 
 CNI_API int cni_read_frames(float* outBuffer, int frameCount, int channelCount)
 {
     if (!gSession.running || !gSession.ringBuffer || !outBuffer) return 0;
-    int total = frameCount * channelCount;
-    return (int)cni_rb_read(gSession.ringBuffer, outBuffer, (uint32_t)total) / channelCount;
+    uint32_t total = (uint32_t)(frameCount * channelCount);
+
+    // Pre-fill: output silence until the ring buffer has accumulated enough data
+    // to cover a full Unity DSP block plus jitter headroom. Without this, Unity
+    // drains the buffer faster than AAudio fills it on the first few calls,
+    // causing systematic underruns that produce audible clicks.
+    if (!gSession.prefilled.load(std::memory_order_relaxed))
+    {
+        if (cni_rb_available(gSession.ringBuffer) < gSession.prefillTarget)
+        {
+            memset(outBuffer, 0, total * sizeof(float));
+            return 0;
+        }
+        gSession.prefilled.store(true, std::memory_order_relaxed);
+    }
+
+    uint32_t got = cni_rb_read(gSession.ringBuffer, outBuffer, total);
+    if (got < total)
+        gSession.underrunCount.fetch_add(1, std::memory_order_relaxed);
+    return (int)got / channelCount;
+}
+
+CNI_API uint32_t cni_get_underrun_count()
+{
+    return gSession.underrunCount.load(std::memory_order_relaxed);
+}
+
+CNI_API uint32_t cni_get_overrun_count()
+{
+    return gSession.overrunCount.load(std::memory_order_relaxed);
+}
+
+CNI_API void cni_reset_xrun_counts()
+{
+    gSession.underrunCount.store(0, std::memory_order_relaxed);
+    gSession.overrunCount.store(0,  std::memory_order_relaxed);
+}
+
+CNI_API uint64_t cni_get_frames_captured()
+{
+    return gFramesCaptured.load(std::memory_order_relaxed);
 }
 
 CNI_API int cni_get_input_latency_frames()
