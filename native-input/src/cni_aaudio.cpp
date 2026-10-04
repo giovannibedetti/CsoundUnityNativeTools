@@ -261,7 +261,13 @@ CNI_API int cni_open(int deviceIndex, int channelCount, int bufferSizeFrames, fl
     gSession.overrunCount.store(0,      std::memory_order_relaxed);
     gSession.prefilled.store(false,     std::memory_order_relaxed);
     // Wait for 2× Unity DSP block before consuming — absorbs scheduling jitter.
-    gSession.prefillTarget = (uint32_t)bufferSizeFrames * (uint32_t)actualChannels * 2;
+    // Enough to serve the first read, not enough to become latency. The producer delivers one burst
+    // at a time, so two bursts cover any phase between its callback and ours; sizing this on Unity's
+    // DSP block instead meant 512 frames on a device whose burst is 96, five times more than the
+    // hardware ever needs. The caller keeps its own cushion on top of this one and reports whether it
+    // is starving, so the guard that adapts lives there, not here.
+    gSession.prefillTarget = (uint32_t)std::max(actualFramesPerBurst * 2, ksmps)
+                           * (uint32_t)actualChannels;
     LOGD("AAudio input opened: %d ch @ %d Hz, burst %d frames, sharing=%s",
          actualChannels,
          (int)AAudioStream_getSampleRate(gSession.stream),
