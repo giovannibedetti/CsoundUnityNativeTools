@@ -348,3 +348,10 @@ CNI_API int cni_is_running()
 {
     return gSession.running ? 1 : 0;
 }
+
+// Stub: AudioUnitRender errors are Apple-specific.
+// Always returns 0 on Android (AAudio has no equivalent concept).
+CNI_API int32_t cni_get_last_render_error()
+{
+    return 0;
+}

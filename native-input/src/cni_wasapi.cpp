@@ -898,3 +898,10 @@ CNI_API uint64_t cni_get_frames_captured()
 {
     return gFramesCaptured.load(std::memory_order_relaxed);
 }
+
+// Stub: AudioUnitRender errors are Apple-specific.
+// Always returns 0 on Windows (WASAPI has no equivalent concept).
+CNI_API int32_t cni_get_last_render_error()
+{
+    return 0;
+}

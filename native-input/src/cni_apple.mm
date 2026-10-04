@@ -81,7 +81,8 @@ struct Session
 };
 
 static Session gSession;
-static std::atomic<uint64_t> gFramesCaptured { 0 }; // incremented per-callback when render succeeds
+static std::atomic<uint64_t> gFramesCaptured  { 0 }; // incremented per-callback when render succeeds
+static std::atomic<int32_t>  gLastRenderError { 0 }; // last OSStatus from AudioUnitRender (0 = no error)
 
 // ---------------------------------------------------------------------------
 // AudioUnit render callback (called on the audio thread, shared all platforms)
@@ -125,10 +126,12 @@ static OSStatus InputCallback(void*                       inRefCon,
                                          1 /*input bus*/, inNumberFrames, s->captureABL);
     if (renderErr != noErr)
     {
+        // Store the error so cni_get_last_render_error() can report it to the C# side.
         // Common causes:
-        //   -10863 (kAudioUnitErr_NoConnection) → microphone permission denied on macOS
+        //   -10863 (kAudioUnitErr_NoConnection) → device not bound before format set, or
+        //                                         microphone permission denied in macOS Privacy
         //   -10877 (kAudioComponentErr_InstanceInvalidated) → device disconnected
-        // Log once per unique error code to avoid flooding.
+        gLastRenderError.store((int32_t)renderErr, std::memory_order_relaxed);
         static OSStatus lastErr = noErr;
         if (renderErr != lastErr)
         {
@@ -225,6 +228,23 @@ static int SetupAudioUnit(Session* s, int channelCount, int bufferSizeFrames, fl
     AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_EnableIO,
                          kAudioUnitScope_Output, 0, &zero, sizeof(zero));
 
+#if TARGET_OS_OSX
+    // On macOS (AUHAL) bind the device BEFORE setting the stream format.
+    // The AUHAL needs to know the hardware capabilities (channel count, supported
+    // sample rates) to validate the format we're about to request, and to set up
+    // sample-rate conversion if the requested rate differs from the device rate.
+    // Binding it after the format set — even if still before AudioUnitInitialize —
+    // can cause AudioUnitRender to return kAudioUnitErr_NoConnection (-10863)
+    // because the input bus has no valid hardware association when the format is
+    // committed.
+    // Skip binding if devId == kAudioObjectUnknown (placeholder / permission not yet
+    // granted): the AUHAL will use the system default input device automatically,
+    // and AudioOutputUnitStart() will trigger the macOS permission dialog.
+    if (devId != kAudioObjectUnknown)
+        AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_CurrentDevice,
+                             kAudioUnitScope_Global, 0, &devId, sizeof(devId));
+#endif
+
     // Non-interleaved 32-bit float, N channels.
     AudioStreamBasicDescription fmt = {};
     fmt.mSampleRate       = sampleRate;
@@ -250,14 +270,6 @@ static int SetupAudioUnit(Session* s, int channelCount, int bufferSizeFrames, fl
     UInt32 maxFrames = (UInt32)bufferSizeFrames * 4;
     AudioUnitSetProperty(s->audioUnit, kAudioUnitProperty_MaximumFramesPerSlice,
                          kAudioUnitScope_Global, 0, &maxFrames, sizeof(maxFrames));
-
-#if TARGET_OS_OSX
-    // On macOS (AUHAL), the device MUST be bound before AudioUnitInitialize.
-    // Doing it afterwards is silently ignored and the unit captures from the
-    // wrong (or no) device.
-    AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_CurrentDevice,
-                         kAudioUnitScope_Global, 0, &devId, sizeof(devId));
-#endif
 
     if (AudioUnitInitialize(s->audioUnit) != noErr) return -12;
 
@@ -339,6 +351,29 @@ CNI_API int cni_get_device_count()
         if (ch > 0)
             gDevices.push_back({ id, MacGetDeviceName(id), ch, MacGetSampleRate(id) });
     }
+
+    // macOS 14+ Sonoma / 15 Sequoia: kAudioDevicePropertyStreamConfiguration with input scope
+    // returns an empty AudioBufferList (mNumberBuffers=0) when microphone permission is
+    // NotDetermined or Denied, causing MacGetInputChannels() to return 0 for every device.
+    // On Sequoia even kAudioHardwarePropertyDefaultInputDevice may be restricted.
+    //
+    // Unconditional fallback: if we found no input devices (regardless of the reason),
+    // add a placeholder "Default Input" entry with nativeId = kAudioObjectUnknown (0).
+    // PlatformOpen() will query kAudioHardwarePropertyDefaultInputDevice at open time;
+    // if that also fails, the AUHAL proceeds without an explicit device binding and uses
+    // whatever the system default is.  AudioOutputUnitStart() will trigger the macOS
+    // permission dialog when authorization is NotDetermined.
+    // Once the user grants access, call EnumerateDevices() again for the real device list.
+    if (gDevices.empty())
+    {
+        NSLog(@"[CsoundNativeInput] cni_get_device_count: all devices reported 0 input channels. "
+              @"Likely cause: microphone permission not yet granted (macOS 14+/15+). "
+              @"Adding placeholder 'Default Input' (id=kAudioObjectUnknown). "
+              @"cni_open() will attempt to start the AUHAL, which may trigger the permission dialog. "
+              @"Grant access in System Settings -> Privacy & Security -> Microphone, "
+              @"then call EnumerateDevices() again for correct channel counts.");
+        gDevices.push_back({ kAudioObjectUnknown, "Default Input", 2, 0.f });
+    }
     return (int)gDevices.size();
 }
 
@@ -372,7 +407,27 @@ static int PlatformOpen(Session* s, int deviceIndex, int channelCount, int buffe
         if (channelCount > maxCh) channelCount = maxCh;
     }
 
-    // Try to set the requested I/O buffer size on the device.
+    // If devId is kAudioObjectUnknown (placeholder added when permission was not granted),
+    // try to resolve the real default input device now.  On macOS 14+/15+ this query may
+    // succeed even though kAudioDevicePropertyStreamConfiguration was restricted during
+    // enumeration.  If it fails, devId stays kAudioObjectUnknown and SetupAudioUnit()
+    // will skip the explicit device binding, letting the AUHAL use the system default.
+    if (devId == kAudioObjectUnknown)
+    {
+        AudioObjectPropertyAddress defProp = {
+            kAudioHardwarePropertyDefaultInputDevice,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 sz = sizeof(devId);
+        AudioObjectGetPropertyData(kAudioObjectSystemObject, &defProp, 0, nullptr, &sz, &devId);
+        NSLog(@"[CsoundNativeInput] PlatformOpen: placeholder device — resolved default input id=%u%s",
+              (unsigned)devId,
+              devId == kAudioObjectUnknown ? " (still unknown, proceeding without device binding)" : "");
+    }
+
+    // Try to set the requested I/O buffer size on the device (skip for unknown id).
+    if (devId != kAudioObjectUnknown)
     {
         AudioObjectPropertyAddress prop = {
             kAudioDevicePropertyBufferFrameSize,
@@ -389,17 +444,18 @@ static int PlatformOpen(Session* s, int deviceIndex, int channelCount, int buffe
     // When the hardware nominal rate differs (e.g. mic at 44100, Unity at 48000)
     // CoreAudio applies transparent SRC — far better than the ring buffer
     // draining at 6900 samples/s and producing periodic underrun glitches.
-    float hwRate    = MacGetSampleRate(devId);
-    s->sampleRate   = (sampleRate > 0.f) ? sampleRate : hwRate;
+    // For an unknown device id, fall back to the requested rate directly.
+    float hwRate    = (devId != kAudioObjectUnknown) ? MacGetSampleRate(devId) : 0.f;
+    s->sampleRate   = (sampleRate > 0.f) ? sampleRate : (hwRate > 0.f ? hwRate : 44100.f);
 
     // devId is passed into SetupAudioUnit so it can bind the device BEFORE
     // AudioUnitInitialize (macOS AUHAL requirement).
+    // If devId == kAudioObjectUnknown, SetupAudioUnit() skips the binding.
     int err = SetupAudioUnit(s, channelCount, bufferSizeFrames, s->sampleRate, devId);
     if (err != 0) return err;
 
-    // Query the actual buffer frame size from the device.
-    // The device binding happened inside SetupAudioUnit (before Initialize), so the
-    // device ID is valid and after AudioObjectSetPropertyData has been applied.
+    // Query the actual buffer frame size from the device (skip for unknown id).
+    if (devId != kAudioObjectUnknown)
     {
         AudioObjectPropertyAddress prop = {
             kAudioDevicePropertyBufferFrameSize,
@@ -410,6 +466,10 @@ static int PlatformOpen(Session* s, int deviceIndex, int channelCount, int buffe
         UInt32 sz  = sizeof(bfs);
         AudioObjectGetPropertyData(devId, &prop, 0, nullptr, &sz, &bfs);
         s->latencyFrames = (int)bfs;
+    }
+    else
+    {
+        s->latencyFrames = bufferSizeFrames; // best estimate without hardware info
     }
 
     return 0;
@@ -625,7 +685,8 @@ CNI_API void cni_close()
     gSession.channelCount  = 0;
     gSession.latencyFrames = 0;
     gSession.sampleRate    = 0.f;
-    gFramesCaptured.store(0, std::memory_order_relaxed);
+    gFramesCaptured.store(0,  std::memory_order_relaxed);
+    gLastRenderError.store(0, std::memory_order_relaxed);
 }
 
 CNI_API int cni_read_frames(float* outBuffer, int frameCount, int channelCount)
@@ -641,11 +702,21 @@ CNI_API int cni_get_input_latency_frames()
 }
 
 // Returns total audio frames successfully captured by the CoreAudio callback since cni_open.
-// If this stays at 0 while running, the AudioUnit is not receiving data
-// (wrong device, permission issue, or hardware error).
+// If this stays at 0 while running, check cni_get_last_render_error() for the cause.
 CNI_API uint64_t cni_get_frames_captured()
 {
     return gFramesCaptured.load(std::memory_order_relaxed);
+}
+
+// Returns the last OSStatus error returned by AudioUnitRender inside the capture callback.
+// 0 = no error (render is succeeding).
+// -10863 (kAudioUnitErr_NoConnection): device was not bound before stream format was set,
+//   or microphone permission is denied in System Settings → Privacy & Security → Microphone.
+// -10877 (kAudioComponentErr_InstanceInvalidated): device was disconnected.
+// Reset to 0 on cni_open / cni_close.
+CNI_API int32_t cni_get_last_render_error()
+{
+    return gLastRenderError.load(std::memory_order_relaxed);
 }
 
 CNI_API int cni_is_running()
