@@ -32,6 +32,7 @@
 #include <atomic>
 #include <cstring>
 #include <cstdlib>
+#include <unistd.h>   // usleep, while waiting for a device rate change to take
 
 #define CNI_API extern "C" __attribute__((visibility("default")))
 
@@ -78,6 +79,12 @@ struct Session
     int                 latencyFrames  = 0;
     float               sampleRate     = 0.f;
     std::atomic<bool>   running        { false };
+
+    // macOS only. Set when we changed the device's nominal sample rate and therefore owe it a
+    // restore: deviceId is what to put back, restoreRate is the value we found it on. Zero means
+    // we changed nothing, which is the default.
+    uint32_t            deviceId       = 0;
+    double              restoreRate    = 0.0;
 };
 
 static Session gSession;
@@ -222,27 +229,48 @@ static int SetupAudioUnit(Session* s, int channelCount, int bufferSizeFrames, fl
     if (AudioComponentInstanceNew(comp, &s->audioUnit) != noErr) return -11;
 
     // Enable input bus (bus 1), disable output bus (bus 0).
+    //
+    // Every one of these used to be called for its side effect with the OSStatus thrown away, so a
+    // setup that half failed looked exactly like one that worked and only showed up later as
+    // kAudioUnitErr_NoConnection from AudioUnitRender, with nothing saying why. Each is checked now
+    // and gets its own return code.
     UInt32 one = 1, zero = 0;
-    AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_EnableIO,
-                         kAudioUnitScope_Input,  1, &one,  sizeof(one));
-    AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_EnableIO,
-                         kAudioUnitScope_Output, 0, &zero, sizeof(zero));
+    OSStatus st = AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Input,  1, &one,  sizeof(one));
+    if (st != noErr)
+    {
+        NSLog(@"[CsoundNativeInput] EnableIO(input) failed: %d", (int)st);
+        return -13;
+    }
+    // Not fatal: some devices refuse to have the output bus disabled, and capture still works.
+    st = AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_EnableIO,
+                              kAudioUnitScope_Output, 0, &zero, sizeof(zero));
+    if (st != noErr)
+        NSLog(@"[CsoundNativeInput] EnableIO(output off) failed: %d — continuing", (int)st);
 
 #if TARGET_OS_OSX
     // On macOS (AUHAL) bind the device BEFORE setting the stream format.
     // The AUHAL needs to know the hardware capabilities (channel count, supported
     // sample rates) to validate the format we're about to request, and to set up
     // sample-rate conversion if the requested rate differs from the device rate.
-    // Binding it after the format set — even if still before AudioUnitInitialize —
-    // can cause AudioUnitRender to return kAudioUnitErr_NoConnection (-10863)
-    // because the input bus has no valid hardware association when the format is
-    // committed.
+    // Binding it after the format set, even if still before AudioUnitInitialize, leaves the input bus
+    // without a hardware association when the format is committed, so this order is the right one.
+    // It was once believed to be the cause of kAudioUnitErr_NoConnection (-10863); it is not. That was
+    // measured to come from declaring a sample rate the hardware was not running at — see the two
+    // modes below.
     // Skip binding if devId == kAudioObjectUnknown (placeholder / permission not yet
     // granted): the AUHAL will use the system default input device automatically,
     // and AudioOutputUnitStart() will trigger the macOS permission dialog.
     if (devId != kAudioObjectUnknown)
-        AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_CurrentDevice,
-                             kAudioUnitScope_Global, 0, &devId, sizeof(devId));
+    {
+        st = AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_CurrentDevice,
+                                  kAudioUnitScope_Global, 0, &devId, sizeof(devId));
+        if (st != noErr)
+        {
+            NSLog(@"[CsoundNativeInput] CurrentDevice(%u) failed: %d", (unsigned)devId, (int)st);
+            return -14;
+        }
+    }
 #endif
 
     // Non-interleaved 32-bit float, N channels.
@@ -257,13 +285,41 @@ static int SetupAudioUnit(Session* s, int channelCount, int bufferSizeFrames, fl
     fmt.mFramesPerPacket  = 1;
     fmt.mBytesPerFrame    = sizeof(float);
 
-    AudioUnitSetProperty(s->audioUnit, kAudioUnitProperty_StreamFormat,
-                         kAudioUnitScope_Output, 1, &fmt, sizeof(fmt));
+    st = AudioUnitSetProperty(s->audioUnit, kAudioUnitProperty_StreamFormat,
+                              kAudioUnitScope_Output, 1, &fmt, sizeof(fmt));
+    if (st != noErr)
+    {
+        NSLog(@"[CsoundNativeInput] StreamFormat(%.0f Hz, %dch) refused: %d",
+              (double)sampleRate, channelCount, (int)st);
+        return -15;
+    }
+
+    // Read back what the unit kept, on both sides of the input bus: the input scope is the hardware
+    // side, the output scope is ours. When they disagree on the rate the unit is supposed to convert,
+    // and when it cannot, AudioUnitRender fails — so the two numbers are worth having in the log the
+    // one time someone needs them.
+    {
+        AudioStreamBasicDescription in = {}, out = {};
+        UInt32 sz = sizeof(in);
+        AudioUnitGetProperty(s->audioUnit, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Input,  1, &in,  &sz);
+        sz = sizeof(out);
+        AudioUnitGetProperty(s->audioUnit, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Output, 1, &out, &sz);
+        NSLog(@"[CsoundNativeInput] input bus: hardware side %.0f Hz %uch, our side %.0f Hz %uch",
+              in.mSampleRate,  (unsigned)in.mChannelsPerFrame,
+              out.mSampleRate, (unsigned)out.mChannelsPerFrame);
+    }
 
     // Install render callback on input bus.
     AURenderCallbackStruct cb = { InputCallback, s };
-    AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_SetInputCallback,
-                         kAudioUnitScope_Global, 1, &cb, sizeof(cb));
+    st = AudioUnitSetProperty(s->audioUnit, kAudioOutputUnitProperty_SetInputCallback,
+                              kAudioUnitScope_Global, 1, &cb, sizeof(cb));
+    if (st != noErr)
+    {
+        NSLog(@"[CsoundNativeInput] SetInputCallback failed: %d", (int)st);
+        return -16;
+    }
 
     // 4× headroom covers SRC-expanded frame counts (e.g. 44100→48000 ≈ 1.09×)
     // and devices that snap bufferSizeFrames up to the next power-of-two.
@@ -271,7 +327,12 @@ static int SetupAudioUnit(Session* s, int channelCount, int bufferSizeFrames, fl
     AudioUnitSetProperty(s->audioUnit, kAudioUnitProperty_MaximumFramesPerSlice,
                          kAudioUnitScope_Global, 0, &maxFrames, sizeof(maxFrames));
 
-    if (AudioUnitInitialize(s->audioUnit) != noErr) return -12;
+    st = AudioUnitInitialize(s->audioUnit);
+    if (st != noErr)
+    {
+        NSLog(@"[CsoundNativeInput] AudioUnitInitialize failed: %d", (int)st);
+        return -12;
+    }
 
     return 0;
 }
@@ -439,14 +500,62 @@ static int PlatformOpen(Session* s, int deviceIndex, int channelCount, int buffe
     }
 
     s->channelCount = channelCount;
-    // Use the rate Unity requests (AudioSettings.outputSampleRate) so that the
-    // AUHAL output-scope format matches what the Unity audio thread expects.
-    // When the hardware nominal rate differs (e.g. mic at 44100, Unity at 48000)
-    // CoreAudio applies transparent SRC — far better than the ring buffer
-    // draining at 6900 samples/s and producing periodic underrun glitches.
-    // For an unknown device id, fall back to the requested rate directly.
-    float hwRate    = (devId != kAudioObjectUnknown) ? MacGetSampleRate(devId) : 0.f;
-    s->sampleRate   = (sampleRate > 0.f) ? sampleRate : (hwRate > 0.f ? hwRate : 44100.f);
+
+    // Two modes, and sampleRate is what picks between them:
+    //
+    //   <= 0   leave the device alone and capture at whatever rate it is already on. Nothing
+    //          outside this process is touched, which is why it is the default: a microphone
+    //          shared with every other app on the machine is not ours to retune.
+    //   >  0   put the device on that rate, remembering the rate we found it on so cni_close can
+    //          put it back. This is what lets a 44.1 kHz microphone feed a 48 kHz Csound with no
+    //          resampling anywhere.
+    //
+    // Either way the AudioUnit format below is built from the rate the device ACTUALLY ends up on,
+    // read back from the device rather than assumed. Declaring a rate the hardware is not running
+    // at does not buy transparent sample-rate conversion on an AUHAL input bus: it buys
+    // kAudioUnitErr_NoConnection (-10863) and a render callback that never fires once. Measured on
+    // a MacBook microphone sitting at 44100 while Unity asked for 48000 — the capture never
+    // started, and the error said nothing about rates.
+    float hwRate = (devId != kAudioObjectUnknown) ? MacGetSampleRate(devId) : 0.f;
+
+    const float rateGap = hwRate > sampleRate ? hwRate - sampleRate : sampleRate - hwRate;
+    if (sampleRate > 0.f && devId != kAudioObjectUnknown && hwRate > 0.f && rateGap > 1.f)
+    {
+        AudioObjectPropertyAddress rateProp = {
+            kAudioDevicePropertyNominalSampleRate,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        Float64 wanted = (Float64)sampleRate;
+        if (AudioObjectSetPropertyData(devId, &rateProp, 0, nullptr,
+                                       sizeof(wanted), &wanted) == noErr)
+        {
+            // A restore is owed only now, and only to the rate we found it on.
+            s->restoreRate = (double)hwRate;
+            s->deviceId    = (uint32_t)devId;
+
+            // The set returns as soon as the request is accepted; the device reconfigures on its own
+            // time, and until it has, it still reports the old rate. Building the AudioUnit in that
+            // window gives it a format the hardware is not on yet, and the capture never starts —
+            // which is exactly what turning this option on did before this wait existed. Poll instead
+            // of assuming, with a ceiling so a device that never settles cannot hang the open.
+            float settled = MacGetSampleRate(devId);
+            for (int waited = 0; waited < 200 && settled > 0.f &&
+                                 (settled > sampleRate ? settled - sampleRate
+                                                       : sampleRate - settled) > 1.f; waited++)
+            {
+                usleep(10000);                       // 10 ms, so at most 2 s in total
+                settled = MacGetSampleRate(devId);
+            }
+            NSLog(@"[CsoundNativeInput] device settled at %.0f Hz", (double)settled);
+            hwRate = settled;
+        }
+        NSLog(@"[CsoundNativeInput] asked the device for %.0f Hz, it is now at %.0f Hz%s",
+              (double)sampleRate, (double)hwRate,
+              s->restoreRate > 0.0 ? " (restored on close)" : " (the device refused, capturing at its own rate)");
+    }
+
+    s->sampleRate = hwRate > 0.f ? hwRate : (sampleRate > 0.f ? sampleRate : 44100.f);
 
     // devId is passed into SetupAudioUnit so it can bind the device BEFORE
     // AudioUnitInitialize (macOS AUHAL requirement).
@@ -523,6 +632,15 @@ static int PlatformOpen(Session* s, int deviceIndex, int channelCount, int buffe
     }
 
     s->channelCount = channelCount;
+
+    // 0 means "whatever the session is already on" — the same contract as the macOS branch, where
+    // it means "do not retune the device". Here there is nothing to retune, so it simply asks for
+    // the rate already in force rather than for 0 Hz.
+    if (sampleRate <= 0.f)
+    {
+        sampleRate = (float)[AVAudioSession sharedInstance].sampleRate;
+        if (sampleRate <= 0.f) sampleRate = 48000.f;
+    }
     s->sampleRate   = sampleRate; // AVAudioSession will try to honour this
 
     NSError* error = nil;
@@ -678,6 +796,25 @@ CNI_API void cni_close()
         for (auto& d : gDevices)
             if (d.portUID) { [d.portUID release]; d.portUID = nil; }
     }
+#endif
+
+#if !TARGET_OS_IOS && !TARGET_OS_VISION
+    // Put the device back on the rate we found it on. Only ever set when we changed it, so a
+    // session that left the device alone cannot disturb it here either.
+    if (gSession.restoreRate > 0.0 && gSession.deviceId != 0)
+    {
+        AudioObjectPropertyAddress rateProp = {
+            kAudioDevicePropertyNominalSampleRate,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        Float64 back = (Float64)gSession.restoreRate;
+        AudioObjectSetPropertyData((AudioDeviceID)gSession.deviceId, &rateProp, 0, nullptr,
+                                   sizeof(back), &back);
+        NSLog(@"[CsoundNativeInput] device sample rate restored to %.0f Hz", (double)back);
+    }
+    gSession.restoreRate = 0.0;
+    gSession.deviceId    = 0;
 #endif
 
     cni_rb_destroy(gSession.ringBuffer); gSession.ringBuffer = nullptr;
