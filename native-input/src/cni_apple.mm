@@ -720,6 +720,46 @@ CNI_API float cni_get_device_nominal_sample_rate(int index)
     return gDevices[index].nominalSampleRate;
 }
 
+// Returns the index into the enumerated list of the system's current default input device,
+// or -1 when the list is empty. Enumerate first: this reads the same vector as the getters above.
+CNI_API int cni_get_default_device_index()
+{
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (gDevices.empty()) return -1;
+
+#if TARGET_OS_OSX
+    AudioObjectPropertyAddress defProp = {
+        kAudioHardwarePropertyDefaultInputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioDeviceID defId = kAudioObjectUnknown;
+    UInt32 sz = sizeof(defId);
+    OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject, &defProp,
+                                             0, nullptr, &sz, &defId);
+    if (st == noErr && defId != kAudioObjectUnknown)
+        for (int i = 0; i < (int)gDevices.size(); i++)
+            if (gDevices[i].nativeId == defId) return i;
+
+    // The query failed, or named a device that enumeration could not see — which is the
+    // placeholder case: permission was not granted, so the list holds one entry that
+    // resolves to the default at open time anyway.
+    return 0;
+#else
+    // iOS and visionOS capture through the session's current input route, which *is* the
+    // system default; the enumeration puts it first.
+    return 0;
+#endif
+}
+
+// Returns the channels the open session actually captures, which is the request limited to
+// what the device owns. 0 when closed. Read it after cni_open: on iOS the count is negotiated
+// with the audio session, so no capability query predicts it.
+CNI_API int cni_get_channel_count()
+{
+    return gSession.channelCount;
+}
+
 // Forward declaration — cni_close is defined below but called from cni_open.
 CNI_API void cni_close();
 

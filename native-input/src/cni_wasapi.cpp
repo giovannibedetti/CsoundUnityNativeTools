@@ -387,6 +387,48 @@ CNI_API float cni_get_device_nominal_sample_rate(int index)
     return gDevices[index].nominalSampleRate;
 }
 
+// Returns the index into the enumerated list of the system's current default capture endpoint,
+// or -1 when the list is empty. Enumerate first: this matches against the same vector.
+CNI_API int cni_get_default_device_index()
+{
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (gDevices.empty()) return -1;
+
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    IMMDeviceEnumerator* pEnum = nullptr;
+    IMMDevice*           pDev  = nullptr;
+    LPWSTR               id    = nullptr;
+    int                  found = 0;
+
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
+
+    // eConsole, not eCommunications: the device the user picked for general recording, which is
+    // what the Sound control panel calls the default. eCommunications is the headset-for-calls role.
+    if (SUCCEEDED(hr) && SUCCEEDED(pEnum->GetDefaultAudioEndpoint(eCapture, eConsole, &pDev)) &&
+        SUCCEEDED(pDev->GetId(&id)) && id)
+    {
+        std::wstring defId(id);
+        for (int i = 0; i < (int)gDevices.size(); i++)
+            if (gDevices[i].id == defId) { found = i; break; }
+        CoTaskMemFree(id);
+    }
+
+    SafeRelease((IUnknown**)&pDev);
+    SafeRelease((IUnknown**)&pEnum);
+    CoUninitialize();
+    return found;
+}
+
+// Returns the channels the open session actually captures, which is the request limited to what
+// the device owns. 0 when closed.
+CNI_API int cni_get_channel_count()
+{
+    return gSession.channelCount;
+}
+
 CNI_API void cni_close();
 
 // ---------------------------------------------------------------------------

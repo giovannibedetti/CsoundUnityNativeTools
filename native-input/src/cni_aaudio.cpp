@@ -340,6 +340,22 @@ CNI_API void cni_reset_xrun_counts()
     gSession.overrunCount.store(0,  std::memory_order_relaxed);
 }
 
+// Index 0 is AAudio device id 0, AAUDIO_UNSPECIFIED, which *is* the default microphone — so the
+// default is always index 0 here, whether or not the list has been enumerated yet. It stops being
+// trivially 0 once AudioManager enumeration over JNI lands and adds real devices after it.
+CNI_API int cni_get_default_device_index()
+{
+    return 0;
+}
+
+// Returns the channels the open stream actually captures, as AAudio reports them. 0 when closed.
+// On this backend it is the only honest figure: the enumerated device claims one channel because
+// nothing here asks AudioManager, so the capability number is a placeholder and this one is not.
+CNI_API int cni_get_channel_count()
+{
+    return gSession.channelCount;
+}
+
 CNI_API uint64_t cni_get_frames_captured()
 {
     return gFramesCaptured.load(std::memory_order_relaxed);
