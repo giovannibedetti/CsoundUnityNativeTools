@@ -1,4 +1,5 @@
 # CMake build directories
+native-input/build/
 native-input/build-*/
 **/CMakeCache.txt
 **/CMakeFiles/
