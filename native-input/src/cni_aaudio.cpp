@@ -53,6 +53,7 @@ struct Session
     int                     channelCount  = 0;
     std::atomic<bool>       running       { false };
     int                     latencyFrames = 0;
+    int                     framesPerBurst = 0;
     std::atomic<uint32_t>   underrunCount { 0 };
     std::atomic<uint32_t>   overrunCount  { 0 };
     // Pre-fill: hold off reading until the ring buffer has accumulated this many
@@ -227,8 +228,9 @@ CNI_API int cni_open(int deviceIndex, int channelCount, int bufferSizeFrames, fl
     int32_t actualChannels       = AAudioStream_getChannelCount(gSession.stream);
     aaudio_sharing_mode_t actualSharing = AAudioStream_getSharingMode(gSession.stream);
 
-    gSession.channelCount  = actualChannels;
-    gSession.latencyFrames = actualFramesPerBurst * 2; // approximate
+    gSession.channelCount   = actualChannels;
+    gSession.latencyFrames  = actualFramesPerBurst * 2; // approximate
+    gSession.framesPerBurst = actualFramesPerBurst;
 
     // Size the ring buffer so it can hold at least one full Unity DSP block.
     // bufferSizeFrames is max(_requestedBufferFrames, AudioSettings.bufferSize) from C#,
@@ -364,6 +366,15 @@ CNI_API uint64_t cni_get_frames_captured()
 CNI_API int cni_get_input_latency_frames()
 {
     return gSession.latencyFrames;
+}
+
+// Frames the device hands over in one delivery, which is what the ring has to absorb between
+// reads, and so what the caller has to size its reserve on. 0 when closed, or before the first
+// delivery. Every backend reports the same thing here: not a buffer capacity, not a round trip.
+// One burst: the latency figure above is two of them.
+CNI_API int cni_get_device_period_frames()
+{
+    return gSession.running ? gSession.framesPerBurst : 0;
 }
 
 CNI_API int cni_is_running()

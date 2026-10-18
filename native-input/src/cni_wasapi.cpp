@@ -90,6 +90,11 @@ struct Session
 static Session               gSession;
 static std::atomic<uint64_t> gFramesCaptured { 0 };
 
+// Taken from the callbacks themselves rather than from the client's buffer size: in shared mode the
+// buffer is capacity and not granularity, and on one interface the two were 1058 frames against 441.
+static std::atomic<int32_t>  gPeriodFrames   { 0 };
+static std::atomic<int32_t>  gPeriodProbes   { 0 };
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -220,6 +225,15 @@ static DWORD WINAPI CaptureThreadProc(LPVOID param)
             // channels (handles float32 shared mode and integer exclusive mode).
             cniConvertExtractWrite(s, pData, numFrames);
             gFramesCaptured += numFrames;
+
+            // Settle on the biggest of the first deliveries and then stop looking. Later a stall
+            // makes one callback arrive carrying a backlog, and that is not the period.
+            if (gPeriodProbes.load(std::memory_order_relaxed) < 64)
+            {
+                gPeriodProbes.fetch_add(1, std::memory_order_relaxed);
+                if ((int32_t)numFrames > gPeriodFrames.load(std::memory_order_relaxed))
+                    gPeriodFrames.store((int32_t)numFrames, std::memory_order_relaxed);
+            }
         }
         else if (numFrames > 0 && s->channelCount > 0)
         {
@@ -456,6 +470,8 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
 {
     if (gSession.running) cni_close();
     gFramesCaptured = 0;
+    gPeriodFrames.store(0, std::memory_order_relaxed);
+    gPeriodProbes.store(0, std::memory_order_relaxed);
     gSession.exclusive = false;
 
     if (ksmps <= 0) ksmps = 128;
@@ -910,6 +926,8 @@ CNI_API void cni_close()
     gSession.sampleRate         = 0.f;
     gSession.exclusive          = false;
     gFramesCaptured.store(0, std::memory_order_relaxed);
+    gPeriodFrames.store(0, std::memory_order_relaxed);
+    gPeriodProbes.store(0, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +947,14 @@ CNI_API int cni_read_frames(float* outBuffer, int frameCount, int channelCount)
 CNI_API int cni_get_input_latency_frames()
 {
     return gSession.latencyFrames;
+}
+
+// Frames the device hands over in one delivery, which is what the ring has to absorb between
+// reads, and so what the caller has to size its reserve on. 0 when closed, or before the first
+// delivery. Every backend reports the same thing here: not a buffer capacity, not a round trip.
+CNI_API int cni_get_device_period_frames()
+{
+    return gSession.running ? gPeriodFrames.load(std::memory_order_relaxed) : 0;
 }
 
 CNI_API int cni_is_running()

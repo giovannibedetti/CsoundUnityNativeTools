@@ -878,6 +878,15 @@ CNI_API int cni_get_input_latency_frames()
     return gSession.latencyFrames;
 }
 
+// Frames the device hands over in one delivery, which is what the ring has to absorb between
+// reads, and so what the caller has to size its reserve on. 0 when closed, or before the first
+// delivery. Every backend reports the same thing here: not a buffer capacity, not a round trip.
+// On these backends the figure is the device's own buffer, which is already one delivery.
+CNI_API int cni_get_device_period_frames()
+{
+    return gSession.running ? gSession.latencyFrames : 0;
+}
+
 // Returns total audio frames successfully captured by the CoreAudio callback since cni_open.
 // If this stays at 0 while running, check cni_get_last_render_error() for the cause.
 CNI_API uint64_t cni_get_frames_captured()
