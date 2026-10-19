@@ -944,6 +944,14 @@ CNI_API int cni_read_frames(float* outBuffer, int frameCount, int channelCount)
     return (int)cni_rb_read(gSession.ringBuffer, outBuffer, (uint32_t)total) / channelCount;
 }
 
+// The rate the open session actually captures at, 0 when closed. Not the same as the enumerated
+// device's nominal rate: that one is a snapshot taken when the list was built, and cni_open may have
+// moved the device since. This is what the stream is running at.
+CNI_API float cni_get_sample_rate()
+{
+    return gSession.sampleRate;
+}
+
 CNI_API int cni_get_input_latency_frames()
 {
     return gSession.latencyFrames;

@@ -54,6 +54,7 @@ struct Session
     std::atomic<bool>       running       { false };
     int                     latencyFrames = 0;
     int                     framesPerBurst = 0;
+    float                   sampleRate    = 0.f;
     std::atomic<uint32_t>   underrunCount { 0 };
     std::atomic<uint32_t>   overrunCount  { 0 };
     // Pre-fill: hold off reading until the ring buffer has accumulated this many
@@ -246,6 +247,7 @@ CNI_API int cni_open(int deviceIndex, int channelCount, int bufferSizeFrames, fl
     gSession.channelCount   = actualChannels;
     gSession.latencyFrames  = actualFramesPerBurst * 2; // approximate
     gSession.framesPerBurst = actualFramesPerBurst;
+    gSession.sampleRate     = (float)AAudioStream_getSampleRate(gSession.stream);
 
     // Size the ring buffer so it can hold at least one full Unity DSP block.
     // bufferSizeFrames is max(_requestedBufferFrames, AudioSettings.bufferSize) from C#,
@@ -376,6 +378,13 @@ CNI_API int cni_get_channel_count()
 CNI_API uint64_t cni_get_frames_captured()
 {
     return gFramesCaptured.load(std::memory_order_relaxed);
+}
+
+// The rate the open stream actually runs at, 0 when closed. AAudio decides it, so this is the only
+// place the rate can be read: no capability query reports one before the stream exists.
+CNI_API float cni_get_sample_rate()
+{
+    return gSession.sampleRate;
 }
 
 CNI_API int cni_get_input_latency_frames()
