@@ -53,7 +53,11 @@ struct DeviceInfo
 {
     std::wstring id;
     std::string  name;
+    // Channels the shared engine grants, which is whatever the sound settings hold.
     int          maxChannels;
+    // Channels the hardware grants in exclusive mode, which can be more: an interface with four
+    // inputs commonly presents a stereo endpoint to the engine and keeps the rest for exclusive.
+    int          maxExclusiveChannels;
     float        nominalSampleRate;
     // Rates the hardware accepts, sorted. Probed in exclusive mode, which is the only share mode
     // that answers for the device instead of for the engine.
@@ -315,6 +319,71 @@ static DWORD WINAPI CaptureThreadProc(LPVOID param)
 // Public API
 // ---------------------------------------------------------------------------
 
+// The raw formats a device may deliver, most to least preferred.
+struct CniFormatCand { WORD bits; WORD valid; bool pcm; };
+static const CniFormatCand kCniFormats[] = {
+    { 32, 32, false }, // float32
+    { 32, 24, true  }, // 24-in-32 int
+    { 24, 24, true  }, // 24-bit packed int
+    { 16, 16, true  }, // 16-bit int
+};
+
+// Fills a WAVEFORMATEXTENSIBLE. The channel mask is the caller's business: see CniMaskCandidates.
+static void CniFillFormat(WAVEFORMATEXTENSIBLE* w, WORD ch, DWORD sr,
+                          const CniFormatCand& f, DWORD mask)
+{
+    ZeroMemory(w, sizeof(*w));
+    w->Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+    w->Format.nChannels       = ch;
+    w->Format.nSamplesPerSec  = sr;
+    w->Format.wBitsPerSample  = f.bits;
+    w->Format.nBlockAlign     = (WORD)(ch * f.bits / 8);
+    w->Format.nAvgBytesPerSec = sr * (DWORD)w->Format.nBlockAlign;
+    w->Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    w->Samples.wValidBitsPerSample = f.valid;
+    w->dwChannelMask          = mask;
+    w->SubFormat = f.pcm ? KSDATAFORMAT_SUBTYPE_PCM : KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+}
+
+// Which channel mask a driver will take cannot be guessed, so every probe tries a short list and
+// keeps the first that is accepted. Some drivers reject a WAVEFORMATEXTENSIBLE carrying no mask;
+// others, the ZOOM AMS-44 among them, grant their four inputs only with an empty one and answer
+// UNSUPPORTED_FORMAT to the positional mask. Writes up to 3 entries, returns how many.
+static int CniMaskCandidates(WORD ch, DWORD devMask, WORD devCh, DWORD out[3])
+{
+    int n = 0;
+    if (devMask && devCh == ch) out[n++] = devMask;
+    const DWORD positional = (ch == 1) ? SPEAKER_FRONT_CENTER :
+                             (ch == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) :
+                                         (DWORD)((1u << ch) - 1u);
+    if (n == 0 || out[0] != positional) out[n++] = positional;
+    out[n++] = 0u;
+    return n;
+}
+
+// Asks whether the device accepts this channel count and rate in exclusive mode, over every format
+// and mask candidate. On success reports which format won, so a later Initialize can reuse it.
+static bool CniProbeExclusive(IAudioClient* client, WORD ch, DWORD sr,
+                              DWORD devMask, WORD devCh, WAVEFORMATEXTENSIBLE* outWfx)
+{
+    if (!client) return false;
+    DWORD masks[3];
+    const int nMasks = CniMaskCandidates(ch, devMask, devCh, masks);
+    for (const CniFormatCand& f : kCniFormats)
+        for (int m = 0; m < nMasks; m++)
+        {
+            WAVEFORMATEXTENSIBLE wfx;
+            CniFillFormat(&wfx, ch, sr, f, masks[m]);
+            if (client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                          (WAVEFORMATEX*)&wfx, nullptr) == S_OK)
+            {
+                if (outWfx) *outWfx = wfx;
+                return true;
+            }
+        }
+    return false;
+}
+
 // The rates the device itself accepts, probed in exclusive mode. Shared mode would answer for the
 // engine, which converts anything into the rate set in the Windows sound settings and so reports
 // that one rate for every device. Nothing is opened: IsFormatSupported only asks the driver.
@@ -323,51 +392,17 @@ static std::vector<float> WasapiProbeSampleRates(IAudioClient* client, WAVEFORMA
     static const DWORD kCandidates[] = {
         8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000
     };
-    struct Cand { WORD bits; WORD valid; bool pcm; };
-    static const Cand kFormats[] = {
-        { 32, 32, false }, // float32
-        { 32, 24, true  }, // 24-in-32 int
-        { 24, 24, true  }, // 24-bit packed int
-        { 16, 16, true  }, // 16-bit int
-    };
 
     std::vector<float> rates;
     if (!client || !mix) return rates;
 
-    const WORD ch = mix->nChannels;
-    DWORD mask = (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
-               ? ((WAVEFORMATEXTENSIBLE*)mix)->dwChannelMask : 0;
-    // A WAVEFORMATEXTENSIBLE with no channel mask is rejected by many drivers, so one is always
-    // supplied. Above stereo the first ch positions stand in: the probe asks whether the rate is
-    // accepted, and a device that cares about which speakers these are would answer no to a zero.
-    if (!mask) mask = (ch == 1) ? SPEAKER_FRONT_CENTER :
-                      (ch == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) :
-                                  (DWORD)((1u << ch) - 1u);
+    const WORD  ch      = mix->nChannels;
+    const DWORD devMask = (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+                        ? ((WAVEFORMATEXTENSIBLE*)mix)->dwChannelMask : 0;
 
     for (DWORD sr : kCandidates)
-    {
-        for (const Cand& f : kFormats)
-        {
-            WAVEFORMATEXTENSIBLE wfx = {};
-            wfx.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
-            wfx.Format.nChannels       = ch;
-            wfx.Format.nSamplesPerSec  = sr;
-            wfx.Format.wBitsPerSample  = f.bits;
-            wfx.Format.nBlockAlign     = (WORD)(ch * f.bits / 8);
-            wfx.Format.nAvgBytesPerSec = sr * (DWORD)wfx.Format.nBlockAlign;
-            wfx.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-            wfx.Samples.wValidBitsPerSample = f.valid;
-            wfx.dwChannelMask          = mask;
-            wfx.SubFormat = f.pcm ? KSDATAFORMAT_SUBTYPE_PCM : KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-
-            if (client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                          (WAVEFORMATEX*)&wfx, nullptr) == S_OK)
-            {
-                rates.push_back((float)sr);
-                break;
-            }
-        }
-    }
+        if (CniProbeExclusive(client, ch, sr, devMask, ch, nullptr))
+            rates.push_back((float)sr);
 
     // A device that grants no exclusive access at all answers nothing. Then the engine's rate is
     // the only one it can be captured at, so it is the whole list.
@@ -375,6 +410,24 @@ static std::vector<float> WasapiProbeSampleRates(IAudioClient* client, WAVEFORMA
 
     std::sort(rates.begin(), rates.end());
     return rates;
+}
+
+// The widest channel count the hardware grants in exclusive mode at its nominal rate. The shared
+// engine reports only what the sound settings hold — stereo, on an interface whose further inputs
+// are reachable but unexposed — so without this the extra inputs could never even be asked for.
+static int WasapiProbeMaxExclusiveChannels(IAudioClient* client, WAVEFORMATEX* mix)
+{
+    if (!client || !mix) return 0;
+    const WORD  devCh   = mix->nChannels;
+    const DWORD devMask = (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+                        ? ((WAVEFORMATEXTENSIBLE*)mix)->dwChannelMask : 0;
+    const DWORD sr      = mix->nSamplesPerSec;
+
+    int best = 0;
+    for (WORD ch : { (WORD)2, (WORD)4, (WORD)6, (WORD)8 })
+        if (ch > devCh && CniProbeExclusive(client, ch, sr, devMask, devCh, nullptr))
+            best = ch;
+    return best;
 }
 
 CNI_API int cni_get_device_count()
@@ -405,8 +458,9 @@ CNI_API int cni_get_device_count()
         if (FAILED(pColl->Item(i, &pDev))) continue;
 
         DeviceInfo info;
-        info.maxChannels       = 2;
-        info.nominalSampleRate = 0.f;
+        info.maxChannels          = 2;
+        info.maxExclusiveChannels = 0;
+        info.nominalSampleRate    = 0.f;
 
         LPWSTR pwszId = nullptr;
         if (SUCCEEDED(pDev->GetId(&pwszId))) { info.id = pwszId; CoTaskMemFree(pwszId); }
@@ -426,9 +480,10 @@ CNI_API int cni_get_device_count()
             WAVEFORMATEX* pwfx = nullptr;
             if (SUCCEEDED(pClient->GetMixFormat(&pwfx)) && pwfx)
             {
-                info.maxChannels       = pwfx->nChannels;
-                info.nominalSampleRate = (float)pwfx->nSamplesPerSec;
-                info.sampleRates       = WasapiProbeSampleRates(pClient, pwfx);
+                info.maxChannels          = pwfx->nChannels;
+                info.nominalSampleRate    = (float)pwfx->nSamplesPerSec;
+                info.sampleRates          = WasapiProbeSampleRates(pClient, pwfx);
+                info.maxExclusiveChannels = WasapiProbeMaxExclusiveChannels(pClient, pwfx);
                 CoTaskMemFree(pwfx);
             }
             pClient->Release();
@@ -453,11 +508,15 @@ CNI_API void cni_get_device_name(int index, char* outName, int maxLen)
     strncpy_s(outName, maxLen, gDevices[index].name.c_str(), _TRUNCATE);
 }
 
+// The most channels the device can give, which above the engine's count needs exclusive mode. A
+// caller that asks for them in shared mode gets the engine's count instead, and cni_get_channel_count
+// reports what the open session actually settled on.
 CNI_API int cni_get_device_channel_count(int index)
 {
     std::lock_guard<std::mutex> lock(gMutex);
     if (index < 0 || index >= (int)gDevices.size()) return 0;
-    return gDevices[index].maxChannels;
+    const DeviceInfo& d = gDevices[index];
+    return (d.maxExclusiveChannels > d.maxChannels) ? d.maxExclusiveChannels : d.maxChannels;
 }
 
 CNI_API float cni_get_device_nominal_sample_rate(int index)
@@ -567,7 +626,12 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
         std::lock_guard<std::mutex> lock(gMutex);
         if (deviceIndex < 0 || deviceIndex >= (int)gDevices.size()) return -1;
         deviceId = gDevices[deviceIndex].id;
-        int maxCh = gDevices[deviceIndex].maxChannels;
+        // The engine grants only what the sound settings hold, so in shared mode that is the
+        // ceiling. Exclusive mode talks past the engine, and an interface whose further inputs it
+        // never exposes can still hand them over, so there the ceiling is what the device grants.
+        const DeviceInfo& d = gDevices[deviceIndex];
+        int maxCh = d.maxChannels;
+        if (exclusiveMode && d.maxExclusiveChannels > maxCh) maxCh = d.maxExclusiveChannels;
         if (channelCount < 1)     channelCount = 1;
         if (channelCount > maxCh) channelCount = maxCh;
     }
@@ -631,12 +695,31 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
             wfxEx.Format.nAvgBytesPerSec = wantedSr * (DWORD)wfxEx.Format.nBlockAlign;
             wfxEx.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
             wfxEx.Samples.wValidBitsPerSample = 32;
-            wfxEx.dwChannelMask = (channelCount == 1) ? SPEAKER_FRONT_CENTER :
-                                  (channelCount == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
-            wfxEx.SubFormat     = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+            wfxEx.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
-            hr = gSession.audioClient->IsFormatSupported(
-                AUDCLNT_SHAREMODE_SHARED, (WAVEFORMATEX*)&wfxEx, &pwfxClosest);
+            // Which channel mask a driver will take cannot be guessed. Some reject a
+            // WAVEFORMATEXTENSIBLE that carries none; the ZOOM AMS-44 accepts its four input
+            // channels only with an empty one, and answers UNSUPPORTED_FORMAT to the positional
+            // mask. So the candidates are tried in turn and the first accepted one is kept.
+            const DWORD maskCands[] = {
+                (devMask && pwfx->nChannels == channelCount) ? devMask : 0u,
+                (channelCount == 1) ? SPEAKER_FRONT_CENTER :
+                (channelCount == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) :
+                                      (DWORD)((1u << channelCount) - 1u),
+                0u,
+            };
+
+            hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
+            for (int mi = 0; mi < 3; mi++)
+            {
+                if (mi == 0 && maskCands[0] == 0u)        continue;  // no device mask to try
+                if (mi == 1 && maskCands[1] == maskCands[0]) continue;
+                wfxEx.dwChannelMask = maskCands[mi];
+                if (pwfxClosest) { CoTaskMemFree(pwfxClosest); pwfxClosest = nullptr; }
+                hr = gSession.audioClient->IsFormatSupported(
+                    AUDCLNT_SHAREMODE_SHARED, (WAVEFORMATEX*)&wfxEx, &pwfxClosest);
+                if (hr == S_OK || hr == S_FALSE) break;
+            }
 
             useFormat = (hr == S_OK) ? (WAVEFORMATEX*)&wfxEx : pwfx;
             if (hr == S_FALSE && pwfxClosest) useFormat = pwfxClosest;
@@ -694,35 +777,17 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
         // latency, but locks the device. Exclusive cannot resample, so it is only
         // valid when the device already runs at Unity's rate. Probes float32 then
         // common integer PCM formats; on success sets useFormat / gSession fields.
-        auto tryExclusive = [&]() -> HRESULT {
-            if (!ratesMatch) return E_FAIL;
-            const DWORD exSr   = pwfx->nSamplesPerSec;
-            const WORD  exCh   = pwfx->nChannels;
-            const DWORD exMask = devMask ? devMask :
-                                 (exCh == 1) ? SPEAKER_FRONT_CENTER :
-                                 (exCh == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
-            struct Cand { WORD bits; WORD valid; bool pcm; };
-            const Cand cands[] = {
-                { 32, 32, false }, // float32
-                { 32, 24, true  }, // 24-in-32 int
-                { 24, 24, true  }, // 24-bit packed int
-                { 16, 16, true  }, // 16-bit int
-            };
+        auto tryExclusive = [&](WORD exCh) -> HRESULT {
+            if (!ratesMatch || exCh < 1) return E_FAIL;
+            const DWORD exSr = pwfx->nSamplesPerSec;
+            DWORD masks[3];
+            const int nMasks = CniMaskCandidates(exCh, devMask, pwfx->nChannels, masks);
+
             HRESULT eh = E_FAIL;
-            for (int ci = 0; ci < 4; ci++)
+            for (const CniFormatCand& cand : kCniFormats)
+            for (int mi = 0; mi < nMasks; mi++)
             {
-                ZeroMemory(&exWfx, sizeof(exWfx));
-                exWfx.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
-                exWfx.Format.nChannels       = exCh;
-                exWfx.Format.nSamplesPerSec  = exSr;
-                exWfx.Format.wBitsPerSample  = cands[ci].bits;
-                exWfx.Format.nBlockAlign     = (WORD)(exCh * cands[ci].bits / 8);
-                exWfx.Format.nAvgBytesPerSec = exSr * exWfx.Format.nBlockAlign;
-                exWfx.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-                exWfx.Samples.wValidBitsPerSample = cands[ci].valid;
-                exWfx.dwChannelMask          = exMask;
-                exWfx.SubFormat = cands[ci].pcm ? KSDATAFORMAT_SUBTYPE_PCM
-                                                : KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+                CniFillFormat(&exWfx, exCh, exSr, cand, masks[mi]);
 
                 if (!reactivate()) return E_FAIL;
                 HRESULT hrFmt = gSession.audioClient->IsFormatSupported(
@@ -764,9 +829,14 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
         bool done = false;
 
         // (A) Preferred exclusive mode (lowest latency) when requested by the host.
+        // The caller's channel count goes first: past the engine a device can grant more channels
+        // than the shared endpoint exposes, and that is the only way to reach them. Falling back
+        // to the engine's count keeps a device that grants only its mix layout working as before.
         if (exclusiveMode && ratesMatch)
         {
-            hr = tryExclusive();
+            hr = tryExclusive((WORD)channelCount);
+            if (FAILED(hr) && channelCount != (int)pwfx->nChannels)
+                hr = tryExclusive(pwfx->nChannels);
             if (SUCCEEDED(hr)) done = true;
         }
 
@@ -897,7 +967,9 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
             //    shared mode but work in exclusive.
             if (FAILED(hr) && !exclusiveMode)
             {
-                HRESULT eh = tryExclusive();
+                // The engine's layout, not the caller's count: exclusive mode was not asked for
+                // here, it is only standing in for a shared mode the driver refused.
+                HRESULT eh = tryExclusive(pwfx->nChannels);
                 if (SUCCEEDED(eh)) hr = eh;
             }
 
@@ -941,6 +1013,14 @@ CNI_API int cni_open(int deviceIndex, int channelCount,
         UINT32 bufSize = 0;
         gSession.audioClient->GetBufferSize(&bufSize);
         gSession.latencyFrames = usedClient3 ? (int)client3Period : (int)bufSize;
+
+        // The caller may have asked for more channels than the mode that won can deliver — the
+        // request is allowed to exceed the engine's layout so exclusive mode gets its chance, and
+        // a fallback to shared then lands here. The capture thread reads deviceChannelCount
+        // samples per frame, so a larger stride would read past the end of every frame.
+        if (gSession.channelCount > gSession.deviceChannelCount)
+            gSession.channelCount = gSession.deviceChannelCount;
+        if (gSession.channelCount < 1) { errCode = -6; goto cleanup; }
 
         // Ring buffer: 16× the engine period in samples.
         // The steady-state fill level is ≈ 0–1 period (latency-neutral); the
