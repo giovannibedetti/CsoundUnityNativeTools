@@ -337,8 +337,12 @@ static std::vector<float> WasapiProbeSampleRates(IAudioClient* client, WAVEFORMA
     const WORD ch = mix->nChannels;
     DWORD mask = (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
                ? ((WAVEFORMATEXTENSIBLE*)mix)->dwChannelMask : 0;
+    // A WAVEFORMATEXTENSIBLE with no channel mask is rejected by many drivers, so one is always
+    // supplied. Above stereo the first ch positions stand in: the probe asks whether the rate is
+    // accepted, and a device that cares about which speakers these are would answer no to a zero.
     if (!mask) mask = (ch == 1) ? SPEAKER_FRONT_CENTER :
-                      (ch == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
+                      (ch == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) :
+                                  (DWORD)((1u << ch) - 1u);
 
     for (DWORD sr : kCandidates)
     {
