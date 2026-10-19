@@ -30,6 +30,8 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>   // usleep, while waiting for a device rate change to take
@@ -52,6 +54,9 @@ struct DeviceInfo
     std::string   name;
     int           maxChannels;
     float         nominalSampleRate; // 0 on iOS/visionOS (AVAudioSession picks it)
+    // Rates the device declares it can run at, sorted. Empty on iOS/visionOS, which answer
+    // with the rate the session granted instead of a list to pick from.
+    std::vector<float> sampleRates;
 };
 
 static std::vector<DeviceInfo> gDevices;
@@ -392,6 +397,51 @@ static float MacGetSampleRate(AudioDeviceID devId)
     return (float)rate;
 }
 
+// The rates a device accepts. Most report one range per rate, with the two ends equal; a few —
+// aggregates, and some virtual devices — report a span instead, and accept anything inside it.
+// A span is turned into the standard rates it contains, because the point of the list is to be
+// picked from.
+static std::vector<float> MacGetAvailableSampleRates(AudioDeviceID devId)
+{
+    static const float kStandardRates[] = {
+        8000.f, 11025.f, 16000.f, 22050.f, 32000.f, 44100.f, 48000.f,
+        64000.f, 88200.f, 96000.f, 176400.f, 192000.f, 352800.f, 384000.f
+    };
+
+    std::vector<float> rates;
+    if (devId == kAudioObjectUnknown) return rates;
+
+    AudioObjectPropertyAddress prop = {
+        kAudioDevicePropertyAvailableNominalSampleRates,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 sz = 0;
+    if (AudioObjectGetPropertyDataSize(devId, &prop, 0, nullptr, &sz) != noErr || sz == 0)
+        return rates;
+
+    std::vector<AudioValueRange> ranges(sz / sizeof(AudioValueRange));
+    if (AudioObjectGetPropertyData(devId, &prop, 0, nullptr, &sz, ranges.data()) != noErr)
+        return rates;
+
+    auto add = [&rates](float r) {
+        if (r <= 0.f) return;
+        for (float have : rates) if (fabsf(have - r) < 1.f) return;
+        rates.push_back(r);
+    };
+
+    for (const auto& range : ranges)
+    {
+        if (range.mMaximum - range.mMinimum < 1.0)
+            add((float)range.mMinimum);
+        else
+            for (float cand : kStandardRates)
+                if (cand >= range.mMinimum - 1.0 && cand <= range.mMaximum + 1.0) add(cand);
+    }
+    std::sort(rates.begin(), rates.end());
+    return rates;
+}
+
 CNI_API int cni_get_device_count()
 {
     std::lock_guard<std::mutex> lock(gMutex);
@@ -410,7 +460,8 @@ CNI_API int cni_get_device_count()
     {
         int ch = MacGetInputChannels(id);
         if (ch > 0)
-            gDevices.push_back({ id, MacGetDeviceName(id), ch, MacGetSampleRate(id) });
+            gDevices.push_back({ id, MacGetDeviceName(id), ch, MacGetSampleRate(id),
+                                 MacGetAvailableSampleRates(id) });
     }
 
     // macOS 14+ Sonoma / 15 Sequoia: kAudioDevicePropertyStreamConfiguration with input scope
@@ -433,7 +484,7 @@ CNI_API int cni_get_device_count()
               @"cni_open() will attempt to start the AUHAL, which may trigger the permission dialog. "
               @"Grant access in System Settings -> Privacy & Security -> Microphone, "
               @"then call EnumerateDevices() again for correct channel counts.");
-        gDevices.push_back({ kAudioObjectUnknown, "Default Input", 2, 0.f });
+        gDevices.push_back({ kAudioObjectUnknown, "Default Input", 2, 0.f, {} });
     }
     return (int)gDevices.size();
 }
@@ -600,7 +651,7 @@ CNI_API int cni_get_device_count()
     if (!inputs || inputs.count == 0)
     {
         // Fallback: built-in mic always present.
-        gDevices.push_back({ nil, "Built-in Microphone", 1, 0.f });
+        gDevices.push_back({ nil, "Built-in Microphone", 1, 0.f, {} });
         return 1;
     }
 
@@ -718,6 +769,26 @@ CNI_API float cni_get_device_nominal_sample_rate(int index)
     std::lock_guard<std::mutex> lock(gMutex);
     if (index < 0 || index >= (int)gDevices.size()) return 0.f;
     return gDevices[index].nominalSampleRate;
+}
+
+// How many rates the device declared, 0 when it declares none. On iOS and visionOS it is always
+// 0: AVAudioSession takes a preferred rate and reports back what it granted, so the only way to
+// learn whether a rate is available is to ask for it.
+CNI_API int cni_get_device_sample_rate_count(int index)
+{
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (index < 0 || index >= (int)gDevices.size()) return 0;
+    return (int)gDevices[index].sampleRates.size();
+}
+
+// One rate from that list, in Hz, or 0 when either index is out of range.
+CNI_API float cni_get_device_sample_rate(int index, int rateIndex)
+{
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (index < 0 || index >= (int)gDevices.size()) return 0.f;
+    const auto& rates = gDevices[index].sampleRates;
+    if (rateIndex < 0 || rateIndex >= (int)rates.size()) return 0.f;
+    return rates[rateIndex];
 }
 
 // Returns the index into the enumerated list of the system's current default input device,

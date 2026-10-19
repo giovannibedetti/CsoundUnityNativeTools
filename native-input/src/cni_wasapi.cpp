@@ -55,6 +55,9 @@ struct DeviceInfo
     std::string  name;
     int          maxChannels;
     float        nominalSampleRate;
+    // Rates the hardware accepts, sorted. Probed in exclusive mode, which is the only share mode
+    // that answers for the device instead of for the engine.
+    std::vector<float> sampleRates;
 };
 
 static std::vector<DeviceInfo> gDevices;
@@ -312,6 +315,64 @@ static DWORD WINAPI CaptureThreadProc(LPVOID param)
 // Public API
 // ---------------------------------------------------------------------------
 
+// The rates the device itself accepts, probed in exclusive mode. Shared mode would answer for the
+// engine, which converts anything into the rate set in the Windows sound settings and so reports
+// that one rate for every device. Nothing is opened: IsFormatSupported only asks the driver.
+static std::vector<float> WasapiProbeSampleRates(IAudioClient* client, WAVEFORMATEX* mix)
+{
+    static const DWORD kCandidates[] = {
+        8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000
+    };
+    struct Cand { WORD bits; WORD valid; bool pcm; };
+    static const Cand kFormats[] = {
+        { 32, 32, false }, // float32
+        { 32, 24, true  }, // 24-in-32 int
+        { 24, 24, true  }, // 24-bit packed int
+        { 16, 16, true  }, // 16-bit int
+    };
+
+    std::vector<float> rates;
+    if (!client || !mix) return rates;
+
+    const WORD ch = mix->nChannels;
+    DWORD mask = (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+               ? ((WAVEFORMATEXTENSIBLE*)mix)->dwChannelMask : 0;
+    if (!mask) mask = (ch == 1) ? SPEAKER_FRONT_CENTER :
+                      (ch == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : 0;
+
+    for (DWORD sr : kCandidates)
+    {
+        for (const Cand& f : kFormats)
+        {
+            WAVEFORMATEXTENSIBLE wfx = {};
+            wfx.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+            wfx.Format.nChannels       = ch;
+            wfx.Format.nSamplesPerSec  = sr;
+            wfx.Format.wBitsPerSample  = f.bits;
+            wfx.Format.nBlockAlign     = (WORD)(ch * f.bits / 8);
+            wfx.Format.nAvgBytesPerSec = sr * (DWORD)wfx.Format.nBlockAlign;
+            wfx.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+            wfx.Samples.wValidBitsPerSample = f.valid;
+            wfx.dwChannelMask          = mask;
+            wfx.SubFormat = f.pcm ? KSDATAFORMAT_SUBTYPE_PCM : KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+            if (client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                          (WAVEFORMATEX*)&wfx, nullptr) == S_OK)
+            {
+                rates.push_back((float)sr);
+                break;
+            }
+        }
+    }
+
+    // A device that grants no exclusive access at all answers nothing. Then the engine's rate is
+    // the only one it can be captured at, so it is the whole list.
+    if (rates.empty()) rates.push_back((float)mix->nSamplesPerSec);
+
+    std::sort(rates.begin(), rates.end());
+    return rates;
+}
+
 CNI_API int cni_get_device_count()
 {
     std::lock_guard<std::mutex> lock(gMutex);
@@ -363,6 +424,7 @@ CNI_API int cni_get_device_count()
             {
                 info.maxChannels       = pwfx->nChannels;
                 info.nominalSampleRate = (float)pwfx->nSamplesPerSec;
+                info.sampleRates       = WasapiProbeSampleRates(pClient, pwfx);
                 CoTaskMemFree(pwfx);
             }
             pClient->Release();
@@ -399,6 +461,26 @@ CNI_API float cni_get_device_nominal_sample_rate(int index)
     std::lock_guard<std::mutex> lock(gMutex);
     if (index < 0 || index >= (int)gDevices.size()) return 0.f;
     return gDevices[index].nominalSampleRate;
+}
+
+// How many rates the hardware accepted when probed, 0 before enumeration. The engine's own rate,
+// the one the sound settings hold, is cni_get_device_nominal_sample_rate: capture in shared mode
+// runs at that one whatever this list says, because the engine converts.
+CNI_API int cni_get_device_sample_rate_count(int index)
+{
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (index < 0 || index >= (int)gDevices.size()) return 0;
+    return (int)gDevices[index].sampleRates.size();
+}
+
+// One rate from that list, in Hz, or 0 when either index is out of range.
+CNI_API float cni_get_device_sample_rate(int index, int rateIndex)
+{
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (index < 0 || index >= (int)gDevices.size()) return 0.f;
+    const std::vector<float>& rates = gDevices[index].sampleRates;
+    if (rateIndex < 0 || rateIndex >= (int)rates.size()) return 0.f;
+    return rates[rateIndex];
 }
 
 // Returns the index into the enumerated list of the system's current default capture endpoint,

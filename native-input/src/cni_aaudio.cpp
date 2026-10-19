@@ -150,6 +150,21 @@ CNI_API float cni_get_device_nominal_sample_rate(int index)
     return 0.f;
 }
 
+// AAudio has no capability query: a rate is requested on the builder and the stream reports what
+// it opened at, resampling when the two differ. There is no list to offer, so 0 says so, and the
+// C# side falls back to asking for a rate and reading back what it got.
+CNI_API int cni_get_device_sample_rate_count(int index)
+{
+    (void)index;
+    return 0;
+}
+
+CNI_API float cni_get_device_sample_rate(int index, int rateIndex)
+{
+    (void)index; (void)rateIndex;
+    return 0.f;
+}
+
 // Returns 0 on success, negative on failure.
 // On failure the C# layer should activate the Unity Microphone API fallback.
 // ksmps / exclusiveMode are accepted to keep the C ABI identical to the Windows
