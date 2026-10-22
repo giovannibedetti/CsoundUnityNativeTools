@@ -11,6 +11,7 @@ scripts** used to produce those binaries:
 |---|---|---|
 | `native-input/` | macOS bundle, iOS / visionOS static libs, Android `.so`, Windows `.dll` (low-latency multichannel audio input via CoreAudio / AAudio / WASAPI) | `Runtime/macOS/`, `Runtime/iOS/`, `Runtime/VisionOS/`, `Runtime/Android/<abi>/`, `Runtime/Win64/` |
 | `android-midi/` | Android MIDI plugin (`CsoundUnityMidi.aar`, wraps `android.media.midi`) | `Runtime/Plugins/Android/` |
+| `.github/workflows/` | Csound itself, built from source on GitHub Actions for macOS, Windows, Android and iOS | `Runtime/macOS/`, `Runtime/Win64/`, `Runtime/Android/<abi>/`, `Runtime/iOS/` |
 
 ## Setup
 
@@ -59,3 +60,36 @@ Each script accepts the same `CSOUNDUNITY_PACKAGE_PATH` env var.
 | Android `.so` (all 4 ABIs) | macOS / Linux | Android NDK + CMake |
 | Windows `.dll` | Windows | Visual Studio 2022 (C++ workload) + CMake |
 | Android MIDI `.aar` | macOS / Linux | JDK 8+, Android SDK (API 23+), Unity (for `classes.jar`) |
+
+## Building Csound itself
+
+`Update Csound` builds Csound from source for the four native platforms and opens a pull
+request on the package with the binaries. Run it from the Actions tab.
+
+What gets built is in [`.github/csound.yml`](.github/csound.yml): a tag pins the package to
+a release, a branch plus `follow: true` has a nightly run rebuild whenever that branch moves.
+The workflows live here rather than in the package because a Unity package installed from a
+git URL is cloned whole, and a `.github` folder there would land in every user's
+`Library/PackageCache`.
+
+All of Csound's own I/O modules are turned off (`USE_JACK`, `USE_PORTAUDIO`, `USE_PORTMIDI`,
+`USE_IPMIDI`, `USE_COREMIDI`, `USE_AUDIOUNIT`, `USE_ALSA`, `USE_PULSEAUDIO`, `USE_PIPEWIRE`),
+and the opcode directory points at a path that does not exist. CsoundUnity does its own audio
+and MIDI, and a library that cannot open a device of its own, and does not go looking for
+plugins next to a system-wide Csound install, is a library that behaves the same on a
+developer's machine and on a user's.
+
+### The token
+
+The last job writes into the package, which a repository's own `GITHUB_TOKEN` cannot do.
+It uses a secret named **`PACKAGE_TOKEN`**: a classic personal access token with the `repo`
+scope, belonging to someone with write access to the package. Fine-grained tokens do not
+work here, as they only reach repositories owned by whoever creates them.
+
+Nothing is merged automatically. The pull request still has to be checked, and on Android
+and iOS that means hearing the samples on a real device.
+
+### Not covered
+
+**WebGL**, whose Csound comes from the `@csound/browser` npm package, and **visionOS**, which
+has never been built from source and ships a copy of the iOS libraries.

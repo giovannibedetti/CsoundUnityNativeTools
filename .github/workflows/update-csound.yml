@@ -1,0 +1,246 @@
+name: Update Csound
+
+# Builds Csound for every platform from one ref and opens a pull request on the package
+# with the results, so updating the libraries does not mean four machines, four downloads
+# and a day of work.
+#
+# This lives here, and not in the package, because a Unity package installed from a git
+# URL is cloned whole: a .github folder there would land in every user's PackageCache.
+# Writing into the package needs a token, since a repository's own GITHUB_TOKEN cannot
+# reach another repository. See the README.
+#
+# Which ref is built is written in .github/csound.yml, not decided by whoever starts the
+# run: that way the choice between a release and following develop is in the repository,
+# shows up in a diff when it changes, and is the same for the nightly check.
+#
+# What is NOT updated here: WebGL, whose Csound comes from the @csound/browser npm
+# package, and visionOS, which has never been built and ships a copy of the iOS libraries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      csound_ref:
+        description: "Build this instead of what .github/csound.yml says"
+        required: false
+      open_pr:
+        description: "Open a pull request on the package"
+        type: boolean
+        default: true
+  schedule:
+    # Only does something when follow is true and the ref has moved.
+    - cron: '0 5 * * *'
+  push:
+    branches: [ ci/csound-build ]
+    paths: [ '.github/workflows/**', '.github/csound.yml' ]
+
+# Two runs would fight over the same branch name and the same artifacts.
+concurrency:
+  group: update-csound
+  cancel-in-progress: true
+
+jobs:
+  decide:
+    name: Which Csound
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.read.outputs.ref }}
+      sha: ${{ steps.read.outputs.sha }}
+      package: ${{ steps.read.outputs.package }}
+      package_ref: ${{ steps.read.outputs.package_ref }}
+      build: ${{ steps.read.outputs.build }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: read
+        env:
+          ASKED_FOR: ${{ inputs.csound_ref }}
+        run: |
+          set -euo pipefail
+          cfg=.github/csound.yml
+          field() { sed -n "s/^$1:[[:space:]]*//p" "$cfg" | tr -d '"' | head -1; }
+
+          ref="${ASKED_FOR:-$(field ref)}"
+          follow=$(field follow)
+          package=$(field package)
+          package_ref=$(field package_ref)
+
+          # A branch or tag resolves to the commit it points at now; anything that does not
+          # resolve is taken to be a commit already.
+          sha=$(git ls-remote https://github.com/csound/csound "$ref" | head -1 | cut -f1)
+          [ -n "$sha" ] || sha="$ref"
+          sha=${sha:0:8}
+
+          echo "ref     = $ref  ->  $sha"
+          echo "package = $package ($package_ref)   follow = $follow"
+
+          build=true
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "$follow" != "true" ]; then
+              echo "follow is off: the nightly check does nothing"
+              build=false
+            else
+              # Two ways of knowing this commit was already handled: the package says so,
+              # or the branch of an earlier run is still waiting to be merged.
+              built=$(curl -sfL "https://raw.githubusercontent.com/$package/$package_ref/.csound-version" | tr -d '[:space:]" ' | sed -n 's/^sha:*//p')
+              if [ "$sha" = "$built" ]; then
+                echo "$ref has not moved since the binaries were built"
+                build=false
+              elif git ls-remote --exit-code --heads "https://github.com/$package" "csound/$sha" >/dev/null 2>&1; then
+                echo "csound/$sha is already open on the package"
+                build=false
+              fi
+            fi
+          fi
+
+          {
+            echo "ref=$ref"; echo "sha=$sha"; echo "build=$build"
+            echo "package=$package"; echo "package_ref=$package_ref"
+          } >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    uses: ./.github/workflows/build-csound-macos.yml
+    with:
+      csound_ref: ${{ needs.decide.outputs.ref }}
+
+  windows:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    uses: ./.github/workflows/build-csound-windows.yml
+    with:
+      csound_ref: ${{ needs.decide.outputs.ref }}
+
+  android:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    uses: ./.github/workflows/build-csound-android.yml
+    with:
+      csound_ref: ${{ needs.decide.outputs.ref }}
+
+  ios:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    uses: ./.github/workflows/build-csound-ios.yml
+    with:
+      csound_ref: ${{ needs.decide.outputs.ref }}
+
+  collect:
+    name: Write them into the package
+    needs: [ decide, macos, windows, android, ios ]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the package
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.decide.outputs.package }}
+          ref: ${{ needs.decide.outputs.package_ref }}
+          token: ${{ secrets.PACKAGE_TOKEN }}
+          path: package
+
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Put each binary where the package keeps it
+        working-directory: package
+        run: |
+          set -euo pipefail
+          dl=../dl
+
+          place() {
+            src="$1"; dst="$2"
+            test -f "$src" || { echo "::error::missing from the artifacts: $src"; exit 1; }
+            # Writing next to a file that is not there means the package layout moved and
+            # the copy would land somewhere Unity does not look.
+            test -f "$dst" || { echo "::error::not in the package: $dst"; exit 1; }
+            cp "$src" "$dst"
+            printf '  %-62s %s\n' "$dst" "$(du -h "$dst" | cut -f1)"
+          }
+
+          # macOS: only the two files the package carries. The Mach-O is already ad-hoc
+          # signed by the build job, and copying it leaves that signature intact.
+          bundle=Runtime/macOS/CsoundLib64.bundle/Contents
+          place "$dl/csound-macos/Contents/MacOS/CsoundLib64" "$bundle/MacOS/CsoundLib64"
+          place "$dl/csound-macos/Contents/Info.plist" "$bundle/Info.plist"
+
+          place "$dl/csound-windows/csound64.dll" Runtime/Win64/csound64.dll
+
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            place "$dl/csound-android-$abi/libcsoundandroid.so" "Runtime/Android/$abi/libcsoundandroid.so"
+            if [ -f "$dl/csound-android-$abi/libsndfile.so" ]; then
+              place "$dl/csound-android-$abi/libsndfile.so" "Runtime/Android/$abi/libsndfile.so"
+            else
+              echo "::warning::$abi: no libsndfile.so built, the one in the package is kept"
+            fi
+          done
+
+          xc=Runtime/iOS/CsoundiOS.xcframework
+          place "$dl/csound-ios-ios-arm64/libCsoundLib-device.a" "$xc/ios-arm64/libCsoundLib-device.a"
+          place "$dl/csound-ios-ios-arm64-simulator/libCsoundLib.a" "$xc/ios-arm64-simulator/libCsoundLib.a"
+
+          # So the package says what is inside those binaries, instead of it being readable
+          # only by running strings on them. The leading dot keeps Unity out of it: no .meta.
+          cat > .csound-version <<EOF
+          ref: ${{ needs.decide.outputs.ref }}
+          sha: ${{ needs.decide.outputs.sha }}
+          built: $(date -u +%Y-%m-%d)
+          EOF
+
+      - name: What changed
+        working-directory: package
+        run: |
+          set -euo pipefail
+          git status --porcelain
+          # A deleted .meta would make Unity hand out a new GUID and break every reference
+          # to the plugin in the samples' scenes.
+          if git status --porcelain Runtime/ | grep -q '^ D'; then
+            echo "::error::something was deleted, not replaced"; exit 1
+          fi
+          if [ -z "$(git status --porcelain Runtime/)" ]; then
+            echo "::warning::nothing changed: this ref builds byte for byte what is already here"
+          fi
+
+      - name: Open the pull request
+        if: ${{ inputs.open_pr || github.event_name == 'schedule' }}
+        working-directory: package
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          REF: ${{ needs.decide.outputs.ref }}
+          SHA: ${{ needs.decide.outputs.sha }}
+          BASE: ${{ needs.decide.outputs.package_ref }}
+        run: |
+          set -euo pipefail
+          test -n "$(git status --porcelain Runtime/)" || { echo "nothing to open a PR for"; exit 0; }
+
+          # Named after the commit, so a run that happens again on the same commit finds
+          # its own branch and does not open a second pull request for it.
+          branch="csound/$SHA"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "$branch is already up there: nothing to open"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Runtime/ .csound-version
+          git commit -m "build(csound): natives to $REF"
+          git push origin "$branch"
+          gh pr create --base "$BASE" --head "$branch" \
+            --title "build(csound): natives to $REF" \
+            --body "Built from csound/csound@\`$SHA\` by [run ${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) in \`${{ github.repository }}\`.
+
+          Not updated here: WebGL, which comes from the \`@csound/browser\` npm package, and visionOS.
+
+          Before merging: the samples have to sound, on a real device for Android and iOS."
+
+      - name: Keep the tree, when no pull request was asked for
+        if: ${{ !inputs.open_pr && github.event_name != 'schedule' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-runtime-with-new-csound
+          path: package/Runtime/

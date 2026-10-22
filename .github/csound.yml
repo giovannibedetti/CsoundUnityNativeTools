@@ -1,0 +1,15 @@
+# Which Csound the package ships, and whether CI goes and gets it by itself.
+#
+# ref          a tag (7.0.0), a branch (develop) or a commit. This is what gets built when
+#              Update Csound runs without being told otherwise.
+# follow       true  the nightly check builds again whenever that ref points somewhere new,
+#                    which is what makes sense while ref is a branch
+#              false nothing is built unless someone asks for it
+# package      the repository the binaries are written into, and the branch the pull
+#              request is opened against.
+
+ref: 7.0.0
+follow: false
+
+package: rorywalsh/CsoundUnity
+package_ref: release_4_0_0
