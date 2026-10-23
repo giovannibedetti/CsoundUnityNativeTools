@@ -1,0 +1,158 @@
+name: Release — publish
+
+# The second half: run this once the release pull request has been merged.
+#
+# The steps are ordered by how hard they are to undo. The documentation site goes first,
+# because a bad commit there is reverted with another one. The tag goes last but one,
+# because a tag cannot be moved — Unity resolves a package URL ending in #vX to it, and
+# anyone who pinned that version would silently receive different contents. The release
+# itself is created as a **draft**: the workflow prepares it, a person publishes it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version being released, without the v"
+        required: true
+      dry_run:
+        description: "Check and show, change nothing"
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the tools
+        uses: actions/checkout@v4
+
+      - name: Read the configuration
+        id: cfg
+        run: |
+          set -euo pipefail
+          field() { sed -n "s/^$1:[[:space:]]*//p" .github/csound.yml | tr -d '"' | head -1; }
+          { echo "package=$(field package)"; echo "package_ref=$(field package_ref)"; } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the package
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.cfg.outputs.package }}
+          ref: ${{ steps.cfg.outputs.package_ref }}
+          token: ${{ secrets.PACKAGE_TOKEN }}
+          path: package
+          fetch-depth: 0
+
+      - name: Check that this commit really is the release
+        working-directory: package
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Publishing from a branch that never got the release pull request would tag the
+          # wrong tree, so the three numbers and the changelog have to say so themselves.
+          python3 ../release-tools/check_version.py --package . --doxyfile ../release-tools/doxygen/Doxyfile
+          grep -q "\"version\": \"$V\"" package.json \
+            || { echo "::error::package.json does not carry $V"; exit 1; }
+          grep -q "packageVersion = \"$V\"" Runtime/CsoundUnity.cs \
+            || { echo "::error::CsoundUnity.cs does not carry $V"; exit 1; }
+          head -1 CHANGELOG.md | grep -qE "^## \[$V\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" \
+            || { echo "::error::CHANGELOG is not headed '## [$V] - <date>'"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/v$V" >/dev/null 2>&1; then
+            echo "::error::v$V is already tagged; a release is added, never rewritten"; exit 1
+          fi
+          echo "  releasing $(git rev-parse --short HEAD) on ${{ steps.cfg.outputs.package_ref }}"
+
+      - name: Build the API documentation
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq doxygen graphviz
+          mkdir -p doxyout
+          cd package
+          DOXY_DIR="$GITHUB_WORKSPACE/release-tools/doxygen" DOXY_OUT="$GITHUB_WORKSPACE/doxyout" \
+            doxygen "$GITHUB_WORKSPACE/release-tools/doxygen/Doxyfile"
+          cd ..
+          warn=$(wc -l < doxyout/warnings.txt)
+          echo "  $(find doxyout/html -name '*.html' | wc -l) pages, $warn warning lines"
+          [ "$warn" -eq 0 ] || { echo "::error::Doxygen reported warnings"; cat doxyout/warnings.txt; exit 1; }
+
+      - name: Read the release notes out of the changelog
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib
+          v = os.environ["V"]
+          text = pathlib.Path("package/CHANGELOG.md").read_text(encoding="utf-8")
+          # The section for this version, up to the next one. Pasted, not linked: release
+          # notes are a snapshot, GitHub mails them out, and the anchor carries the date.
+          m = re.search(rf"^## \[{re.escape(v)}\][^\n]*\n(.*?)(?=^## \[|\Z)", text, re.S | re.M)
+          if not m:
+              raise SystemExit(f"::error::no changelog section for {v}")
+          body = m.group(1).strip()
+          print(f"  {len(body.splitlines())} lines of notes")
+          pathlib.Path("notes.md").write_text(body + "\n", encoding="utf-8")
+          PY
+
+      - name: Update the documentation site
+        if: ${{ !inputs.dry_run }}
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --branch github-pages --depth 1 \
+            "https://x-access-token:${{ secrets.PACKAGE_TOKEN }}@github.com/${{ steps.cfg.outputs.package }}.git" pages
+          # The pages are copies of the package's own documentation; v3/ and the docsify
+          # index are the site's and must survive untouched.
+          cp package/Documentation~/*.md pages/docs/
+          cp -r package/Documentation~/images/. pages/docs/images/ 2>/dev/null || true
+          rm -rf pages/docs/html && cp -r doxyout/html pages/docs/html
+          cd pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "  the site already matches this release"
+          else
+            git commit -qm "docs: CsoundUnity $V"
+            git push -q origin github-pages
+            echo "  site updated"
+          fi
+
+      - name: Tag it
+        if: ${{ !inputs.dry_run }}
+        working-directory: package
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Last reversible moment passed: from here the version name is taken.
+          git tag -a "v$V" -m "CsoundUnity v$V"
+          git push origin "refs/tags/v$V"
+          echo "  tagged $(git rev-parse --short "v$V^{commit}")"
+
+      - name: Draft the release
+        if: ${{ !inputs.dry_run }}
+        working-directory: package
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          pre=""
+          case "$V" in *alpha*|*beta*|*rc*) pre="--prerelease" ;; esac
+          gh release create "v$V" --draft $pre \
+            --title "CsoundUnity $V" --notes-file ../notes.md
+          echo "  drafted; it is not public until someone publishes it"
+
+      - name: What a real run would do
+        if: ${{ inputs.dry_run }}
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          echo "  update github-pages with $(find doxyout/html -name '*.html' | wc -l) API pages and the package docs"
+          echo "  tag v$V on ${{ steps.cfg.outputs.package_ref }}"
+          echo "  draft a release with these notes:"
+          sed 's/^/    /' notes.md | head -20

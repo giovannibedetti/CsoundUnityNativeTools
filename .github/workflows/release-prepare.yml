@@ -1,0 +1,146 @@
+name: Release — prepare
+
+# The first half of a release: everything that can be undone by closing a pull request.
+# It writes the version where it has to agree, dates the changelog, points the install
+# instructions at the new tag and builds the API docs — then opens a pull request on the
+# package and stops.
+#
+# Nothing here creates a tag or a release. Those come after the pull request is merged,
+# from Release — publish, because a tag has to name a commit that actually landed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (e.g. 4.0.0-beta.1)"
+        required: true
+      dry_run:
+        description: "Check and show, change nothing"
+        type: boolean
+        default: true
+
+jobs:
+  prepare:
+    name: Prepare ${{ inputs.version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the tools
+        uses: actions/checkout@v4
+
+      - name: Read the configuration
+        id: cfg
+        run: |
+          set -euo pipefail
+          field() { sed -n "s/^$1:[[:space:]]*//p" .github/csound.yml | tr -d '"' | head -1; }
+          { echo "package=$(field package)"; echo "package_ref=$(field package_ref)"; } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the package
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.cfg.outputs.package }}
+          ref: ${{ steps.cfg.outputs.package_ref }}
+          token: ${{ secrets.PACKAGE_TOKEN }}
+          path: package
+
+      - name: Refuse a version that already exists
+        working-directory: package
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # A tag that already exists must never be moved: Unity resolves a package URL
+          # ending in #vX to the tag, and anyone who pinned it would silently get different
+          # contents under the same name.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$V" >/dev/null 2>&1; then
+            echo "::error::v$V is already tagged; releases are added, never rewritten"
+            exit 1
+          fi
+
+      - name: Write the version where it has to agree
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 release-tools/check_version.py --package package "$V"
+          python3 release-tools/check_version.py --package package
+
+      - name: Date the changelog
+        working-directory: package
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          head=$(head -1 CHANGELOG.md)
+          # The section for this release has to be there already, written by hand: the
+          # workflow dates it, it does not invent its contents.
+          case "$head" in
+            "## [$V] - unreleased") ;;
+            *) echo "::error::CHANGELOG starts with '$head'; expected '## [$V] - unreleased'"; exit 1 ;;
+          esac
+          sed -i "1s|.*|## [$V] - $(date -u +%Y-%m-%d)|" CHANGELOG.md
+          head -1 CHANGELOG.md
+
+      - name: Point the install instructions at the new tag
+        working-directory: package
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          before=$(grep -c "CsoundUnity.git#v" Documentation~/importing.md)
+          sed -i -E "s|(CsoundUnity\.git#v)[^\"\` ]+|\1$V|g" Documentation~/importing.md
+          after=$(grep -c "CsoundUnity.git#v$V" Documentation~/importing.md)
+          echo "  tag references: $before found, $after now point at v$V"
+          [ "$before" = "$after" ] || { echo "::error::some references were left behind"; exit 1; }
+
+      - name: Build the API documentation
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq doxygen graphviz
+          mkdir -p doxyout
+          cd package
+          DOXY_DIR="$GITHUB_WORKSPACE/release-tools/doxygen" DOXY_OUT="$GITHUB_WORKSPACE/doxyout" \
+            doxygen "$GITHUB_WORKSPACE/release-tools/doxygen/Doxyfile"
+          cd ..
+          pages=$(find doxyout/html -name "*.html" | wc -l)
+          warn=$(wc -l < doxyout/warnings.txt)
+          echo "  $pages pages, $warn warning lines"
+          # Zero warnings is the standard this documentation is held to; a release is
+          # exactly the wrong moment to let it slip.
+          if [ "$warn" -ne 0 ]; then
+            echo "::error::Doxygen reported warnings"; cat doxyout/warnings.txt; exit 1
+          fi
+
+      - name: What would change
+        working-directory: package
+        run: git --no-pager diff --stat
+
+      - name: Keep the documentation for the publish step
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-docs-${{ inputs.version }}
+          path: doxyout/html
+
+      - name: Open the pull request
+        if: ${{ !inputs.dry_run }}
+        working-directory: package
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          V: ${{ inputs.version }}
+          BASE: ${{ steps.cfg.outputs.package_ref }}
+        run: |
+          set -euo pipefail
+          branch="release/v$V"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::error::$branch already exists"; exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -qam "chore(release): $V"
+          git push -q origin "$branch"
+          gh pr create --base "$BASE" --head "$branch" \
+            --title "chore(release): $V" \
+            --body "$(printf '%s\n\n%s\n' \
+              "Version written in package.json, CsoundUnity.cs and the Doxyfile; changelog dated; install instructions pointed at \`v$V\`." \
+              "Merge this, then run **Release — publish** with the same version to tag it, publish the release and update the documentation site.")"

@@ -105,3 +105,31 @@ at this.
 ### Not covered
 
 **visionOS**, which has never been built from source and ships a copy of the iOS libraries.
+
+## Cutting a release
+
+Two workflows, run in order, because a tag has to name a commit that actually landed.
+
+**Release — prepare** writes the version into `package.json`, `CsoundUnity.cs` and the
+Doxyfile, dates the changelog section, points the install instructions in `importing.md` at
+the new tag, builds the API documentation, and opens a pull request on the package. Nothing
+it does survives closing that pull request.
+
+Merge it, then **Release — publish**: it updates the documentation site, tags the merged
+commit, and drafts the release with the notes taken from the changelog. The release is a
+**draft** — a person publishes it.
+
+Both start with `dry_run` on: they run every check, show what they would do, and change
+nothing. The checks are the point, so they are worth listing:
+
+- a version that is already tagged is refused, in both workflows. Unity resolves a package
+  URL ending in `#vX` to the tag, so moving one hands different contents to everyone who
+  pinned that version. Releases are added, never rewritten.
+- the changelog section has to exist already, headed `## [version] - unreleased`. The
+  workflow dates it; it does not write release notes.
+- Doxygen has to finish with **zero warnings**, or the release stops.
+- every `#v…` in `importing.md` has to end up pointing at the new tag; one left behind
+  fails the run.
+
+The site keeps `docs/v3/` and its docsify `index.html`: only the pages copied from
+`Documentation~` and the generated `docs/html/` are replaced.
