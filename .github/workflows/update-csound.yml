@@ -82,7 +82,7 @@ jobs:
             else
               # Two ways of knowing this commit was already handled: the package says so,
               # or the branch of an earlier run is still waiting to be merged.
-              built=$(curl -sfL "https://raw.githubusercontent.com/$package/$package_ref/.csound-version" | tr -d '[:space:]" ' | sed -n 's/^sha:*//p')
+              built=$(curl -sfL "https://raw.githubusercontent.com/$package/$package_ref/.csound-version" | sed -n 's/^sha:[[:space:]]*//p' | tr -d '[:space:]')
               if [ "$sha" = "$built" ]; then
                 echo "$ref has not moved since the binaries were built"
                 build=false
@@ -184,11 +184,9 @@ jobs:
 
           # So the package says what is inside those binaries, instead of it being readable
           # only by running strings on them. The leading dot keeps Unity out of it: no .meta.
-          cat > .csound-version <<EOF
-          ref: ${{ needs.decide.outputs.ref }}
-          sha: ${{ needs.decide.outputs.sha }}
-          built: $(date -u +%Y-%m-%d)
-          EOF
+          printf 'ref: %s\nsha: %s\nbuilt: %s\n' \
+            '${{ needs.decide.outputs.ref }}' '${{ needs.decide.outputs.sha }}' "$(date -u +%Y-%m-%d)" \
+            > .csound-version
 
       - name: What changed
         working-directory: package
@@ -230,13 +228,16 @@ jobs:
           git add Runtime/ .csound-version
           git commit -m "build(csound): natives to $REF"
           git push origin "$branch"
+
+          run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "Built from csound/csound@\`$SHA\` by [run ${{ github.run_number }}]($run) in \`${{ github.repository }}\`." \
+            "Not updated here: WebGL, which comes from the \`@csound/browser\` npm package, and visionOS." \
+            "Before merging: the samples have to sound, on a real device for Android and iOS.")
+
           gh pr create --base "$BASE" --head "$branch" \
             --title "build(csound): natives to $REF" \
-            --body "Built from csound/csound@\`$SHA\` by [run ${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) in \`${{ github.repository }}\`.
-
-          Not updated here: WebGL, which comes from the \`@csound/browser\` npm package, and visionOS.
-
-          Before merging: the samples have to sound, on a real device for Android and iOS."
+            --body "$body"
 
       - name: Keep the tree, when no pull request was asked for
         if: ${{ !inputs.open_pr && github.event_name != 'schedule' }}

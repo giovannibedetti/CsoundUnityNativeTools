@@ -105,10 +105,6 @@ jobs:
           cp "$BIN" CsoundLib64.bundle/Contents/MacOS/CsoundLib64
           # Unity loads the plugin by this bare name
           install_name_tool -id CsoundLib64 CsoundLib64.bundle/Contents/MacOS/CsoundLib64
-          # install_name_tool leaves the signature invalid, and an unsigned library is
-          # refused outright on Apple silicon
-          codesign --force --sign - CsoundLib64.bundle/Contents/MacOS/CsoundLib64
-
           cat > CsoundLib64.bundle/Contents/Info.plist <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -126,6 +122,15 @@ jobs:
           </dict>
           </plist>
           PLIST
+
+          # Signed last, with the Info.plist already in place: codesign reads the bundle it
+          # finds around the binary, and against a missing Info.plist it invents an
+          # identifier with a hash in it instead of the plain name. install_name_tool has
+          # invalidated the signature by now anyway, and an unsigned library is refused
+          # outright on Apple silicon.
+          codesign --force --sign - --identifier CsoundLib64 \
+            CsoundLib64.bundle/Contents/MacOS/CsoundLib64
+          codesign -dvv CsoundLib64.bundle/Contents/MacOS/CsoundLib64 2>&1 | grep -E "Identifier|Signature"
 
       - name: Check what came out
         run: |
