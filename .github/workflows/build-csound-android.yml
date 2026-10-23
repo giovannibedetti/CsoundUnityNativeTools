@@ -109,11 +109,16 @@ jobs:
 
       - name: Collect the libraries
         run: |
+          sudo apt-get install -y -qq patchelf
           mkdir -p out/${{ matrix.abi }}
           # The package ships the Csound library under the name Unity loads, plus libsndfile
           lib=$(find csound/build -name "libcsound.so*" -type f | head -1)
           test -n "$lib" || { echo "::error::libcsound.so not found"; exit 1; }
           cp "$lib" out/${{ matrix.abi }}/libcsoundandroid.so
+          # The soname is the name Android's loader files the library under, so it has to
+          # match the file: the package loads it as csoundandroid, and the official Android
+          # release builds it under that name to begin with.
+          patchelf --set-soname libcsoundandroid.so out/${{ matrix.abi }}/libcsoundandroid.so
 
           snd=$(find csound -name "libsndfile.so*" -type f | head -1)
           if [ -n "$snd" ]; then
@@ -129,6 +134,7 @@ jobs:
           # Which shared libraries it will look for on the device. libsndfile belongs here
           # only if it was not linked in: the package ships one next to it, and the two
           # have to agree about which it is.
+          readelf --wide -d "$lib" | sed -n 's/.*SONAME.*\[\(.*\)\]/  soname: \1/p'
           echo "  needs:"
           readelf --wide -d "$lib" | sed -n 's/.*NEEDED.*\[\(.*\)\]/    \1/p'
           for fn in csoundCreate csoundCompileCSD csoundStart csoundPerformKsmps \
