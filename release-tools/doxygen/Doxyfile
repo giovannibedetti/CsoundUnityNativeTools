@@ -4,7 +4,7 @@
 #   DOXY_DIR=<this folder> DOXY_OUT=<where the html goes> \
 #   cd <package> && doxygen <this folder>/Doxyfile
 PROJECT_NAME           = CsoundUnity
-PROJECT_NUMBER         = 4.0.0-alpha.1
+PROJECT_NUMBER         = $(DOXYGEN_PROJECT_NUMBER)
 OUTPUT_DIRECTORY       = $(DOXY_OUT)
 HTML_OUTPUT            = html
 

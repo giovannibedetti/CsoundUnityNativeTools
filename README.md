@@ -110,8 +110,9 @@ at this.
 
 Two workflows, run in order, because a tag has to name a commit that actually landed.
 
-**Release — prepare** writes the version into `package.json`, `CsoundUnity.cs` and the
-Doxyfile, dates the changelog section, points the install instructions in `importing.md` at
+**Release — prepare** writes the version into `package.json` and `CsoundUnity.cs` — the two
+files that carry it; the Doxyfile receives it at generation time through
+`DOXYGEN_PROJECT_NUMBER` — dates the changelog section, points the install instructions in `importing.md` at
 the new tag, builds the API documentation, and opens a pull request on the package. Nothing
 it does survives closing that pull request.
 

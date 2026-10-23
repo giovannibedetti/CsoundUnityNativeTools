@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""The package version lives in three files that have to agree.
+"""The package version lives in two files that have to agree.
 
-    check_version.py --package <dir>                 report the three, exit 1 if they differ
-    check_version.py --package <dir> 4.0.0-alpha.1   write that version into all three
+    check_version.py --package <dir>                 report both, exit 1 if they differ
+    check_version.py --package <dir> 4.0.0-alpha.1   write that version into both
 
 The package is passed in rather than deduced, because this script lives in the
 maintainer repository and not inside the package it writes to — which is what lets
-CI run it. The Doxyfile is the one next to this script unless --doxyfile says
-otherwise.
+CI run it.
+
+The Doxyfile is not one of them: it takes the number through DOXYGEN_PROJECT_NUMBER
+when the documentation is generated, so there is one fewer place to disagree.
 """
 import io
 import os
@@ -19,26 +21,21 @@ HERE = Path(__file__).resolve().parent
 
 
 def paths_from_argv(argv):
-    """Returns (package dir, Doxyfile, version or None) and leaves argv clean."""
+    """Returns (package dir, version or None) and leaves argv clean."""
     pkg = os.environ.get("PACKAGE_DIR")
-    doxy = os.environ.get("DOXYFILE")
     rest = []
     it = iter(argv)
     for a in it:
         if a == "--package":
             pkg = next(it, None)
-        elif a == "--doxyfile":
-            doxy = next(it, None)
         else:
             rest.append(a)
     if not pkg:
         sys.exit("  --package <dir> is required (or set PACKAGE_DIR)")
-    return (Path(pkg).resolve(),
-            Path(doxy).resolve() if doxy else HERE / "doxygen" / "Doxyfile",
-            rest[0] if rest else None)
+    return Path(pkg).resolve(), rest[0] if rest else None
 
 
-PKG, DOXY, WANTED = paths_from_argv(sys.argv[1:])
+PKG, WANTED = paths_from_argv(sys.argv[1:])
 
 # (label, path, regex with one capturing group around the version)
 PLACES = [
@@ -46,8 +43,6 @@ PLACES = [
      re.compile(r'("version"\s*:\s*")([^"]+)(")')),
     ("CsoundUnity.cs",   PKG / "Runtime" / "CsoundUnity.cs",
      re.compile(r'(packageVersion\s*=\s*")([^"]+)(")')),
-    ("Doxyfile",         DOXY,
-     re.compile(r'(PROJECT_NUMBER\s*=\s*)(\S+)(\s*$)', re.MULTILINE)),
 ]
 
 
@@ -83,7 +78,7 @@ def main():
     if wanted is None:
         values = set(found.values())
         if len(values) == 1:
-            print(f"\nall three agree: {values.pop()}")
+            print(f"\nboth agree: {values.pop()}")
             return 0
         print("\nTHEY DIFFER — a release built from this tree would carry the wrong version")
         return 1

@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           # Publishing from a branch that never got the release pull request would tag the
           # wrong tree, so the three numbers and the changelog have to say so themselves.
-          python3 ../release-tools/check_version.py --package . --doxyfile ../release-tools/doxygen/Doxyfile
+          python3 ../release-tools/check_version.py --package .
           grep -q "\"version\": \"$V\"" package.json \
             || { echo "::error::package.json does not carry $V"; exit 1; }
           grep -q "packageVersion = \"$V\"" Runtime/CsoundUnity.cs \
@@ -82,6 +82,7 @@ jobs:
           mkdir -p doxyout
           cd package
           DOXY_DIR="$GITHUB_WORKSPACE/release-tools/doxygen" DOXY_OUT="$GITHUB_WORKSPACE/doxyout" \
+          DOXYGEN_PROJECT_NUMBER="${{ inputs.version }}" \
             doxygen "$GITHUB_WORKSPACE/release-tools/doxygen/Doxyfile"
           cd ..
           warn=$(wc -l < doxyout/warnings.txt)

@@ -111,6 +111,7 @@ jobs:
           mkdir -p doxyout
           cd package
           DOXY_DIR="$GITHUB_WORKSPACE/release-tools/doxygen" DOXY_OUT="$GITHUB_WORKSPACE/doxyout" \
+          DOXYGEN_PROJECT_NUMBER="${{ inputs.version }}" \
             doxygen "$GITHUB_WORKSPACE/release-tools/doxygen/Doxyfile"
           cd ..
           pages=$(find doxyout/html -name "*.html" | wc -l)
