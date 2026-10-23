@@ -84,12 +84,6 @@ jobs:
           set(USE_DOUBLE 0)
           set(BUILD_PLUGINS OFF)
           set(CMAKE_C_STANDARD 11)
-          # Android maps shared libraries with pages of at most 16 KB, while lld defaults to
-          # 64 KB on aarch64 — and the project does not go through the NDK toolchain file,
-          # which is what normally lowers it. A library asking for 64 KB pages is refused by
-          # the loader, with a message that says the library was not found.
-          set(CMAKE_SHARED_LINKER_FLAGS
-              "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
           EOF
 
           cmake -B build -S . \
@@ -124,7 +118,13 @@ jobs:
           # The soname is the name Android's loader files the library under, so it has to
           # match the file: the package loads it as csoundandroid, and the official Android
           # release builds it under that name to begin with.
-          patchelf --set-soname libcsoundandroid.so out/${{ matrix.abi }}/libcsoundandroid.so
+          #
+          # --page-size is not optional here. Rewriting the ELF re-aligns its segments, and
+          # patchelf defaults to 64 KB pages on aarch64 — which Android refuses to map,
+          # reporting the library as not found. 16 KB is what the official build uses and
+          # what Android 15 devices need.
+          patchelf --page-size 16384 --set-soname libcsoundandroid.so \
+            out/${{ matrix.abi }}/libcsoundandroid.so
 
           snd=$(find csound -name "libsndfile.so*" -type f | head -1)
           if [ -n "$snd" ]; then
