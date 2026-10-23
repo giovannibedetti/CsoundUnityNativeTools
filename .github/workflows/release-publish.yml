@@ -19,6 +19,9 @@ on:
         type: boolean
         default: true
 
+env:
+  DOXYGEN_VERSION: "1.18.0"
+
 jobs:
   publish:
     name: Publish ${{ inputs.version }}
@@ -67,7 +70,15 @@ jobs:
       - name: Build the API documentation
         run: |
           set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq doxygen graphviz
+          # Pinned, not apt's: "zero warnings" is a property of a specific Doxygen, and
+          # Ubuntu's 1.9.8 fails to resolve overloads and MYFLT[] signatures that 1.18
+          # resolves — nine warnings on links that are correct. Taking whatever apt has
+          # that day would make the check pass or fail for reasons that are not ours.
+          sudo apt-get update -qq && sudo apt-get install -y -qq graphviz
+          curl -sfL "https://www.doxygen.nl/files/doxygen-$DOXYGEN_VERSION.linux.bin.tar.gz" \
+            | tar xz -C /tmp
+          sudo install "/tmp/doxygen-$DOXYGEN_VERSION/bin/doxygen" /usr/local/bin/doxygen
+          doxygen --version
           mkdir -p doxyout
           cd package
           DOXY_DIR="$GITHUB_WORKSPACE/release-tools/doxygen" DOXY_OUT="$GITHUB_WORKSPACE/doxyout" \

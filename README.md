@@ -127,7 +127,10 @@ nothing. The checks are the point, so they are worth listing:
   pinned that version. Releases are added, never rewritten.
 - the changelog section has to exist already, headed `## [version] - unreleased`. The
   workflow dates it; it does not write release notes.
-- Doxygen has to finish with **zero warnings**, or the release stops.
+- Doxygen has to finish with **zero warnings**, or the release stops. The version is
+  pinned (`DOXYGEN_VERSION`) rather than taken from apt: zero warnings is a property of a
+  specific Doxygen, and Ubuntu's 1.9.8 reports nine on links that are correct, failing to
+  resolve overloads and `MYFLT[]` signatures that 1.18 resolves.
 - every `#v…` in `importing.md` has to end up pointing at the new tag; one left behind
   fails the run.
 
