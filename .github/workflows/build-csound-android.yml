@@ -84,6 +84,10 @@ jobs:
           set(USE_DOUBLE 0)
           set(BUILD_PLUGINS OFF)
           set(CMAKE_C_STANDARD 11)
+          # Devices with 16 KB pages — Android 15 and later — cannot map a library whose
+          # segments are aligned to 4 KB, which is what lld would produce here.
+          set(CMAKE_SHARED_LINKER_FLAGS
+              "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
           EOF
 
           cmake -B build -S . \
@@ -109,22 +113,17 @@ jobs:
 
       - name: Collect the libraries
         run: |
-          sudo apt-get install -y -qq patchelf
           mkdir -p out/${{ matrix.abi }}
           # The package ships the Csound library under the name Unity loads, plus libsndfile
           lib=$(find csound/build -name "libcsound.so*" -type f | head -1)
           test -n "$lib" || { echo "::error::libcsound.so not found"; exit 1; }
           cp "$lib" out/${{ matrix.abi }}/libcsoundandroid.so
-          # The soname is the name Android's loader files the library under, so it has to
-          # match the file: the package loads it as csoundandroid, and the official Android
-          # release builds it under that name to begin with.
-          #
-          # --page-size is not optional here. Rewriting the ELF re-aligns its segments, and
-          # patchelf defaults to 64 KB pages on aarch64 — which Android refuses to map,
-          # reporting the library as not found. 16 KB is what the official build uses and
-          # what Android 15 devices need.
-          patchelf --page-size 16384 --set-soname libcsoundandroid.so \
-            out/${{ matrix.abi }}/libcsoundandroid.so
+          # The soname stays libcsound.so while the file is named libcsoundandroid.so, which
+          # is what the package loads. Unity loads it by full path, so the two need not
+          # match, and setting the soname is not worth what it costs: patchelf rewrites the
+          # ELF and appends a segment whose offset stops being congruent with its address
+          # once Unity strips the library during the build — and a library whose segments
+          # are incongruent is refused by the loader, which then reports it as not found.
 
           snd=$(find csound -name "libsndfile.so*" -type f | head -1)
           if [ -n "$snd" ]; then
@@ -150,6 +149,18 @@ jobs:
             echo "::error::segments ask for $align byte pages; Android allows at most 16384"
             exit 1
           fi
+          # Every loadable segment must have its offset congruent with its address modulo
+          # the alignment, or the loader refuses the library — and says it was not found.
+          readelf --wide -l "$lib" | awk '
+              $1=="LOAD" {
+                  off=strtonum($2); va=strtonum($3); al=strtonum($NF)
+                  if (al > 1 && (off % al) != (va % al)) {
+                      printf "::error::LOAD segment at offset %d is not congruent with address %d (align %d)\n", off, va, al
+                      bad = 1
+                  }
+              }
+              END { exit bad }
+          ' || exit 1
           # Which shared libraries it will look for on the device. libsndfile belongs here
           # only if it was not linked in: the package ships one next to it, and the two
           # have to agree about which it is.
