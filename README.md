@@ -11,7 +11,7 @@ scripts** used to produce those binaries:
 |---|---|---|
 | `native-input/` | macOS bundle, iOS / visionOS static libs, Android `.so`, Windows `.dll` (low-latency multichannel audio input via CoreAudio / AAudio / WASAPI) | `Runtime/macOS/`, `Runtime/iOS/`, `Runtime/VisionOS/`, `Runtime/Android/<abi>/`, `Runtime/Win64/` |
 | `android-midi/` | Android MIDI plugin (`CsoundUnityMidi.aar`, wraps `android.media.midi`) | `Runtime/Plugins/Android/` |
-| `.github/workflows/` | Csound itself, built from source on GitHub Actions for macOS, Windows, Android and iOS | `Runtime/macOS/`, `Runtime/Win64/`, `Runtime/Android/<abi>/`, `Runtime/iOS/` |
+| `.github/workflows/` | Csound itself: built from source on GitHub Actions for macOS, Windows, Android and iOS, fetched from npm for WebGL | `Runtime/macOS/`, `Runtime/Win64/`, `Runtime/Android/<abi>/`, `Runtime/iOS/`, `Runtime/WebGL/` |
 
 ## Setup
 
@@ -89,7 +89,19 @@ work here, as they only reach repositories owned by whoever creates them.
 Nothing is merged automatically. The pull request still has to be checked, and on Android
 and iOS that means hearing the samples on a real device.
 
+### WebGL
+
+WebGL is not built from source: the browser build is published on npm as `@csound/browser`,
+already compiled to WASM, and the workflow fetches it. It carries its own version number —
+7.0.0 there is not built from the tag the other platforms compile, and neither follows the
+other — so `.github/csound.yml` configures it separately, under `browser`.
+
+What the workflow does beyond downloading: it strips the ES module exports from the end of
+`dist/csound.js`. A jspre is concatenated into Unity's `framework.js`, which is not a module,
+and a single `export` stops the whole file from parsing — the build then fails at load with
+"Unable to parse Build/<name>.framework.js", a message that points at compression rather than
+at this.
+
 ### Not covered
 
-**WebGL**, whose Csound comes from the `@csound/browser` npm package, and **visionOS**, which
-has never been built from source and ships a copy of the iOS libraries.
+**visionOS**, which has never been built from source and ships a copy of the iOS libraries.

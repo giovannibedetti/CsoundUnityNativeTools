@@ -1,0 +1,85 @@
+name: Fetch Csound (WebGL)
+
+# WebGL does not build from source here: the browser build is published on npm as
+# @csound/browser, already compiled to WASM. This fetches it and prepares the single file
+# the package ships, Runtime/WebGL/csound.jspre.
+#
+# The version is on its own scale: @csound/browser 7.0.0 is not built from the tag this
+# repository's other workflows compile, and neither follows the other. It is configured
+# separately in .github/csound.yml.
+
+on:
+  workflow_call:
+    inputs:
+      browser_version:
+        description: "@csound/browser version, or 'latest'"
+        required: false
+        type: string
+        default: "latest"
+  workflow_dispatch:
+    inputs:
+      browser_version:
+        description: "@csound/browser version, or 'latest'"
+        required: true
+        default: "latest"
+
+jobs:
+  fetch:
+    name: ${{ inputs.browser_version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download the npm package
+        run: |
+          set -euo pipefail
+          v="${{ inputs.browser_version }}"
+          if [ "$v" = "latest" ]; then
+            v=$(curl -sfL https://registry.npmjs.org/@csound/browser | python3 -c 'import sys,json; print(json.load(sys.stdin)["dist-tags"]["latest"])')
+            echo "latest resolves to $v"
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          curl -sfL "https://registry.npmjs.org/@csound/browser/-/browser-$v.tgz" -o browser.tgz
+          mkdir -p browser && tar xzf browser.tgz -C browser
+          test -f browser/package/dist/csound.js || { echo "::error::dist/csound.js is not in the tarball"; exit 1; }
+
+      - name: Strip the ES module exports
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # A jspre is concatenated into Unity's framework.js, which is not a module: one
+          # `export` there stops the whole file from parsing, and the build then fails at
+          # load with "Unable to parse Build/<name>.framework.js" — a message that points
+          # at compression, not at this. Only the trailing export line and the trailing
+          # source map comment go: the file has two more sourceMappingURL strings inside
+          # the worker code, mid-line, which have to stay.
+          awk '
+              /^const Csound = __csoundEsmExport__;/ {
+                  print "// CsoundUnity: the ES module exports are removed, a jspre is concatenated into Unity'"'"'s"
+                  print "// framework.js and cannot carry them. The bindings themselves stay."
+                  sub(/ export \{ Csound, libcsound \}; export default Csound;/, "")
+                  print
+                  next
+              }
+              /^\/\/# sourceMappingURL=/ { next }
+              { print }
+          ' browser/package/dist/csound.js > out/csound.jspre
+
+      - name: Check what came out
+        run: |
+          set -euo pipefail
+          f=out/csound.jspre
+          # These two are the whole reason this is not a plain copy.
+          if grep -q "export {" "$f"; then
+            echo "::error::an ES export survived the strip, the bundle layout changed"; exit 1
+          fi
+          if ! grep -q "__csoundEsmExport__" "$f"; then
+            echo "::error::the Csound binding is missing, the bundle layout changed"; exit 1
+          fi
+          echo "  version: $VERSION"
+          echo "  size:    $(du -h "$f" | cut -f1)"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: csound-webgl
+          path: out/csound.jspre

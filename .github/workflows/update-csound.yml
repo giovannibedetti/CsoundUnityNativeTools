@@ -13,8 +13,8 @@ name: Update Csound
 # run: that way the choice between a release and following develop is in the repository,
 # shows up in a diff when it changes, and is the same for the nightly check.
 #
-# What is NOT updated here: WebGL, whose Csound comes from the @csound/browser npm
-# package, and visionOS, which has never been built and ships a copy of the iOS libraries.
+# What is NOT updated here: visionOS, which has never been built from source and ships a
+# copy of the iOS libraries.
 
 on:
   workflow_dispatch:
@@ -45,6 +45,7 @@ jobs:
     outputs:
       ref: ${{ steps.read.outputs.ref }}
       sha: ${{ steps.read.outputs.sha }}
+      browser: ${{ steps.read.outputs.browser }}
       package: ${{ steps.read.outputs.package }}
       package_ref: ${{ steps.read.outputs.package_ref }}
       build: ${{ steps.read.outputs.build }}
@@ -62,6 +63,7 @@ jobs:
 
           ref="${ASKED_FOR:-$(field ref)}"
           follow=$(field follow)
+          browser=$(field browser)
           package=$(field package)
           package_ref=$(field package_ref)
 
@@ -72,6 +74,7 @@ jobs:
           sha=${sha:0:8}
 
           echo "ref     = $ref  ->  $sha"
+          echo "browser = $browser"
           echo "package = $package ($package_ref)   follow = $follow"
 
           build=true
@@ -82,9 +85,20 @@ jobs:
             else
               # Two ways of knowing this commit was already handled: the package says so,
               # or the branch of an earlier run is still waiting to be merged.
-              built=$(curl -sfL "https://raw.githubusercontent.com/$package/$package_ref/.csound-version" | sed -n 's/^sha:[[:space:]]*//p' | tr -d '[:space:]')
-              if [ "$sha" = "$built" ]; then
-                echo "$ref has not moved since the binaries were built"
+              have=$(curl -sfL "https://raw.githubusercontent.com/$package/$package_ref/.csound-version" || true)
+              built=$(printf '%s' "$have" | sed -n 's/^sha:[[:space:]]*//p' | tr -d '[:space:]')
+              built_browser=$(printf '%s' "$have" | sed -n 's/^browser:[[:space:]]*//p' | tr -d '[:space:]')
+
+              # WebGL comes from npm on its own release schedule, so the browser package can
+              # move while the Csound tag stays put. Checking only the commit is how the
+              # WebGL build silently fell eight versions behind before.
+              if [ "$browser" = "latest" ]; then
+                browser=$(curl -sfL https://registry.npmjs.org/@csound/browser | python3 -c 'import sys,json; print(json.load(sys.stdin)["dist-tags"]["latest"])')
+                echo "browser latest resolves to $browser"
+              fi
+
+              if [ "$sha" = "$built" ] && [ "$browser" = "$built_browser" ]; then
+                echo "$ref has not moved, and @csound/browser $browser is already in"
                 build=false
               elif git ls-remote --exit-code --heads "https://github.com/$package" "csound/$sha" >/dev/null 2>&1; then
                 echo "csound/$sha is already open on the package"
@@ -94,7 +108,7 @@ jobs:
           fi
 
           {
-            echo "ref=$ref"; echo "sha=$sha"; echo "build=$build"
+            echo "ref=$ref"; echo "sha=$sha"; echo "build=$build"; echo "browser=$browser"
             echo "package=$package"; echo "package_ref=$package_ref"
           } >> "$GITHUB_OUTPUT"
 
@@ -126,9 +140,16 @@ jobs:
     with:
       csound_ref: ${{ needs.decide.outputs.ref }}
 
+  webgl:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    uses: ./.github/workflows/build-csound-webgl.yml
+    with:
+      browser_version: ${{ needs.decide.outputs.browser }}
+
   collect:
     name: Write them into the package
-    needs: [ decide, macos, windows, android, ios ]
+    needs: [ decide, macos, windows, android, ios, webgl ]
     runs-on: ubuntu-latest
 
     steps:
@@ -178,14 +199,17 @@ jobs:
             fi
           done
 
+          place "$dl/csound-webgl/csound.jspre" Runtime/WebGL/csound.jspre
+
           xc=Runtime/iOS/CsoundiOS.xcframework
           place "$dl/csound-ios-ios-arm64/libCsoundLib-device.a" "$xc/ios-arm64/libCsoundLib-device.a"
           place "$dl/csound-ios-ios-arm64-simulator/libCsoundLib.a" "$xc/ios-arm64-simulator/libCsoundLib.a"
 
           # So the package says what is inside those binaries, instead of it being readable
           # only by running strings on them. The leading dot keeps Unity out of it: no .meta.
-          printf 'ref: %s\nsha: %s\nbuilt: %s\n' \
-            '${{ needs.decide.outputs.ref }}' '${{ needs.decide.outputs.sha }}' "$(date -u +%Y-%m-%d)" \
+          printf 'ref: %s\nsha: %s\nbrowser: %s\nbuilt: %s\n' \
+            '${{ needs.decide.outputs.ref }}' '${{ needs.decide.outputs.sha }}' \
+            '${{ needs.decide.outputs.browser }}' "$(date -u +%Y-%m-%d)" \
             > .csound-version
 
       - name: What changed

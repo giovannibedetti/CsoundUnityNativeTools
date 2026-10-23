@@ -5,11 +5,16 @@
 # follow       true  the nightly check builds again whenever that ref points somewhere new,
 #                    which is what makes sense while ref is a branch
 #              false nothing is built unless someone asks for it
+# browser      the @csound/browser version for WebGL, or 'latest'. It is numbered on its
+#              own scale: 7.0.0 there is not built from the tag above, and neither follows
+#              the other, so one version string cannot serve both.
 # package      the repository the binaries are written into, and the branch the pull
 #              request is opened against.
 
 ref: 7.0.0
 follow: false
+
+browser: 7.0.0
 
 package: rorywalsh/CsoundUnity
 package_ref: release_4_0_0
