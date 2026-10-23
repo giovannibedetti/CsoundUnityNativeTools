@@ -238,20 +238,34 @@ jobs:
           set -euo pipefail
           test -n "$(git status --porcelain Runtime/)" || { echo "nothing to open a PR for"; exit 0; }
 
-          # Named after the commit, so a run that happens again on the same commit finds
-          # its own branch and does not open a second pull request for it.
+          # Named after the commit, so a second run on the same commit lands on the branch
+          # that is already open instead of starting a rival one.
           branch="csound/$SHA"
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            echo "$branch is already up there: nothing to open"
-            exit 0
-          fi
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
+
+          existing=
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            existing=1
+            git fetch origin "$branch"
+            git checkout -B "$branch" "origin/$branch"
+          else
+            git checkout -b "$branch"
+          fi
+
           git add Runtime/ .csound-version
+          # On a rebuild only some platforms may differ; nothing to say if none do.
+          if git diff --cached --quiet; then
+            echo "the branch already holds exactly these binaries"
+            exit 0
+          fi
           git commit -m "build(csound): natives to $REF"
           git push origin "$branch"
+
+          if [ -n "$existing" ]; then
+            echo "pushed onto $branch, which already has a pull request open"
+            exit 0
+          fi
 
           run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           body=$(printf '%s\n\n%s\n\n%s\n' \
