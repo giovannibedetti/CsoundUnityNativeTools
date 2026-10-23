@@ -139,10 +139,15 @@ jobs:
           file "$lib"
           # The loader refuses anything above 16 KB, and says "library not found" when it
           # does, so this has to be caught here rather than on a device.
-          align=$(readelf --wide -l "$lib" | awk '$1=="LOAD" {print $NF}' | sort -u | tail -1)
+          align=$(readelf --wide -l "$lib" | awk '$1=="LOAD" {print strtonum($NF)}' | sort -n | tail -1)
+          # An unmeasured segment must fail too: with an empty value $(( )) is 0, which
+          # would quietly pass the test below and let a broken library through.
+          if [ -z "$align" ]; then
+            echo "::error::could not read the segment alignment"; exit 1
+          fi
           echo "  max p_align: $align"
-          if [ "$((align))" -gt 16384 ]; then
-            echo "::error::segments ask for $((align)) byte pages; Android allows at most 16384"
+          if [ "$align" -gt 16384 ]; then
+            echo "::error::segments ask for $align byte pages; Android allows at most 16384"
             exit 1
           fi
           # Which shared libraries it will look for on the device. libsndfile belongs here
