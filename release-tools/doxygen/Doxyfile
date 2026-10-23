@@ -1,0 +1,40 @@
+# CsoundUnity 4.0 — riproduce il perimetro della doc v3 (generata con Doxygen 1.9.3)
+# Va lanciato DALLA radice del package, altrimenti i nomi dei file generati
+# incorporano il percorso assoluto:
+#   DOXY_DIR=<this folder> DOXY_OUT=<where the html goes> \
+#   cd <package> && doxygen <this folder>/Doxyfile
+PROJECT_NAME           = CsoundUnity
+PROJECT_NUMBER         = 4.0.0-alpha.1
+OUTPUT_DIRECTORY       = $(DOXY_OUT)
+HTML_OUTPUT            = html
+
+INPUT                  = Runtime $(DOXY_DIR)/mainpage.md
+RECURSIVE              = YES
+FILE_PATTERNS          = *.cs *.md
+EXCLUDE                =
+USE_MDFILE_AS_MAINPAGE = $(DOXY_DIR)/mainpage.md
+MARKDOWN_SUPPORT       = YES
+
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_PRIVATE        = NO
+
+GENERATE_HTML          = YES
+GENERATE_TREEVIEW      = YES
+SEARCHENGINE           = YES
+GENERATE_LATEX         = NO
+HAVE_DOT               = NO
+
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = $(DOXY_OUT)/warnings.txt
+
+# Internal types are reference for contributors: Doxygen lists them under "Package Functions".
+EXTRACT_PACKAGE        = YES
+
+# The P/Invoke layer: ~200 static extern declarations of the Csound C API, which EXTRACT_PACKAGE
+# would otherwise pour into the member list. Code outside the package goes through CsoundUnity.
+EXCLUDE_SYMBOLS        = NativeMethods
