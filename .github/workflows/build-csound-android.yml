@@ -126,6 +126,11 @@ jobs:
         run: |
           lib=out/${{ matrix.abi }}/libcsoundandroid.so
           file "$lib"
+          # Which shared libraries it will look for on the device. libsndfile belongs here
+          # only if it was not linked in: the package ships one next to it, and the two
+          # have to agree about which it is.
+          echo "  needs:"
+          readelf --wide -d "$lib" | sed -n 's/.*NEEDED.*\[\(.*\)\]/    \1/p'
           for fn in csoundCreate csoundCompileCSD csoundStart csoundPerformKsmps \
                     csoundSetHostAudioIO csoundSetHostMIDIIO csoundGetSpout; do
             readelf --wide --dyn-syms "$lib" | grep -qF "$fn" \
